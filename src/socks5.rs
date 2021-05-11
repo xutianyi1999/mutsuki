@@ -1,10 +1,12 @@
 use std::net::{IpAddr, SocketAddr};
+use std::result::Result::Err;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Error, ErrorKind, Result};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
-use crate::common::{OptionConvert, StdResAutoConvert};
+use crate::common::StdResAutoConvert;
+use crate::Socks5Config;
 
 pub const SOCKS5_VERSION: u8 = 0x05;
 
@@ -38,6 +40,7 @@ trait Encode {
     fn encode(self, buff: &mut [u8]) -> Result<&[u8]>;
 }
 
+#[allow(dead_code)]
 struct NegotiateRequest {
     version: u8,
     nmethods: u8,
@@ -124,6 +127,7 @@ async fn negotiate<RW: AsyncRead + MsgWrite + Send>(stream: &mut RW, is_auth: bo
     }
 }
 
+#[allow(dead_code)]
 struct AuthRequest {
     version: u8,
     username_len: u8,
@@ -213,6 +217,7 @@ async fn auth<RW: AsyncRead + MsgWrite + Send>(
     }
 }
 
+#[allow(dead_code)]
 struct AcceptRequest {
     version: u8,
     cmd: u8,
@@ -342,7 +347,7 @@ impl Encode for AcceptResponse {
 
 async fn accept<RW: AsyncRead + MsgWrite + Send>(stream: &mut RW, peer_addr: SocketAddr) -> Result<()> {
     let request = match AcceptRequest::decode(stream).await? {
-        Some(acceptRequest) => acceptRequest,
+        Some(accept_request) => accept_request,
         None => {
             let address_type_not_supported = 0x08;
             let resp = build_err_resp(address_type_not_supported);
@@ -596,9 +601,42 @@ fn build_err_resp(rep: u8) -> AcceptResponse {
     }
 }
 
-pub async fn get_interface_addr(dest_addr: SocketAddr) -> Result<IpAddr> {
+async fn get_interface_addr(dest_addr: SocketAddr) -> Result<IpAddr> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.connect(dest_addr).await?;
     let addr = socket.local_addr()?;
     Ok(addr.ip())
+}
+
+pub async fn socks5_server_start(config: Socks5Config) -> Result<()> {
+    let listener = TcpListener::bind(config.bind_addr).await?;
+
+    let username_op = config.username;
+    let password_op = config.password;
+    let is_auth = username_op.is_some() && password_op.is_some();
+
+    while let Ok((mut stream, peer_addr)) = listener.accept().await {
+        let inner_username_op = username_op.clone();
+        let inner_password_op = password_op.clone();
+
+        tokio::spawn(async move {
+            let res = async move {
+                negotiate(&mut stream, is_auth).await?;
+
+                if is_auth {
+                    let username = inner_username_op.unwrap();
+                    let password = inner_password_op.unwrap();
+
+                    auth(&mut stream, &username, &password).await?;
+                }
+
+                accept(&mut stream, peer_addr).await
+            };
+
+            if let Err(e) = res.await {
+                error!("{}", e)
+            }
+        });
+    };
+    Ok(())
 }
