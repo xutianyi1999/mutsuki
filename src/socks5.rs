@@ -251,7 +251,7 @@ impl Decode for AcceptRequest {
         let (dest_addr, port) = match addr_type {
             IPV4 => {
                 let mut buff = [0u8; 4 + 2];
-                rx.read(&mut buff).await?;
+                rx.read_exact(&mut buff).await?;
 
                 let mut addr_buff = [0u8; 4];
                 let mut port_buff = [0u8; 2];
@@ -266,7 +266,7 @@ impl Decode for AcceptRequest {
             }
             IPV6 => {
                 let mut buff = [0u8; 16 + 2];
-                rx.read(&mut buff).await?;
+                rx.read_exact(&mut buff).await?;
 
                 let mut addr_buff = [0u8; 16];
                 let mut port_buff = [0u8; 2];
@@ -610,6 +610,7 @@ async fn get_interface_addr(dest_addr: SocketAddr) -> Result<IpAddr> {
 
 pub async fn socks5_server_start(config: Socks5Config) -> Result<()> {
     let listener = TcpListener::bind(config.bind_addr).await?;
+    info!("Listening on socks5://{}", listener.local_addr()?);
 
     let username_op = config.username;
     let password_op = config.password;

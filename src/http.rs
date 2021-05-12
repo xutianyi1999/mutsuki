@@ -42,6 +42,7 @@ pub async fn http_server_start(config: HttpConfig) -> Result<()> {
         .http1_title_case_headers(true)
         .serve(make_service);
 
+    info!("Listening on http://{}", server.local_addr());
     server.await.res_auto_convert()
 }
 
@@ -99,7 +100,7 @@ fn auth(
         let username = username_op.unwrap();
         let password = password_op.unwrap();
 
-        match req.headers().get("Authorization") {
+        match req.headers().get("Proxy-Authorization") {
             Some(head_value) => {
                 let head_str = head_value.to_str().res_auto_convert()?;
                 let slice = &head_str[6..];

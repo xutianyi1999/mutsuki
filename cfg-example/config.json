@@ -1,0 +1,12 @@
+{
+  "socks5": {
+    "bind_addr": "127.0.0.1:19999",
+    "username": "abc",
+    "password": "123"
+  },
+  "http": {
+    "bind_addr": "127.0.0.1:10800",
+    "username": "abc",
+    "password": "123"
+  }
+}
