@@ -15,3 +15,4 @@ log4rs = "1"
 log = "0.4"
 hyper = { version = "0.14", features = ["full"] }
 base64 = "0.13"
+socket2 = "0.4"

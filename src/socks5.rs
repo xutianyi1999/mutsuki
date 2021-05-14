@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Error, ErrorKind, Result};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
-use crate::common::StdResAutoConvert;
+use crate::common::{StdResAutoConvert, TcpSocketExt};
 use crate::Socks5Config;
 
 pub const SOCKS5_VERSION: u8 = 0x05;
@@ -400,6 +400,8 @@ async fn tcp_handle<RW: AsyncRead + MsgWrite + Send>(stream: &mut RW, request: A
         }
     };
 
+    dest_stream.set_keepalive()?;
+
     let success = 0x00;
     let local_addr = dest_stream.local_addr()?;
 
@@ -622,6 +624,7 @@ pub async fn socks5_server_start(config: Socks5Config) -> Result<()> {
 
         tokio::spawn(async move {
             let res = async move {
+                stream.set_keepalive()?;
                 negotiate(&mut stream, is_auth).await?;
 
                 if is_auth {

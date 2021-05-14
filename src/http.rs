@@ -6,7 +6,7 @@ use hyper::upgrade::Upgraded;
 use tokio::io::Result;
 use tokio::net::TcpStream;
 
-use crate::common::StdResAutoConvert;
+use crate::common::{StdResAutoConvert, TcpSocketExt};
 use crate::HttpConfig;
 
 type HttpClient = Client<hyper::client::HttpConnector>;
@@ -87,6 +87,7 @@ fn host_addr(uri: &http::Uri) -> Option<String> {
 
 async fn tunnel(mut upgraded: Upgraded, addr: String) -> Result<()> {
     let mut server = TcpStream::connect(addr).await?;
+    server.set_keepalive()?;
     tokio::io::copy_bidirectional(&mut upgraded, &mut server).await?;
     Ok(())
 }
