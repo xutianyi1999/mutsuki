@@ -1,18 +1,41 @@
+use std::error::Error;
 use std::net::{IpAddr, SocketAddr};
 use std::result::Result::Err;
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Error, ErrorKind, Result};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ErrorKind};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::server::TlsStream;
 
+use crate::{Auth, ProxyConfig, ProxyServer, Socks5};
 use crate::common::{StdResAutoConvert, TcpSocketExt};
-use crate::Socks5Config;
 
 pub const SOCKS5_VERSION: u8 = 0x05;
 
 const IPV4: u8 = 0x01;
 const DOMAIN_NAME: u8 = 0x03;
 const IPV6: u8 = 0x04;
+
+struct Socks5ProxyServer {}
+
+impl ProxyServer for Socks5ProxyServer {
+    async fn start() -> Result<(), Box<dyn Error>> {
+        Ok(())
+    }
+}
+
+impl Socks5ProxyServer {
+    fn new(config: ProxyConfig) -> Self {
+        Socks5ProxyServer {}
+    }
+}
+
+struct Socks5OverTlsProxyServer {}
+
+impl ProxyServer
 
 enum Socks5Addr {
     Ip(IpAddr),
@@ -29,6 +52,8 @@ trait MsgWrite: AsyncWrite + Unpin {
 }
 
 impl MsgWrite for TcpStream {}
+
+impl MsgWrite for TlsStream<TcpStream> {}
 
 #[async_trait]
 trait Decode {
@@ -610,31 +635,44 @@ async fn get_interface_addr(dest_addr: SocketAddr) -> Result<IpAddr> {
     Ok(addr.ip())
 }
 
-pub async fn socks5_server_start(config: Socks5Config) -> Result<()> {
+async fn socks5_codec<RW: AsyncRead + MsgWrite + Send>(
+    stream: &mut RW,
+    peer_addr: SocketAddr,
+    auth_op: Option<Auth>,
+) -> Result<()> {
+    negotiate(stream, auth_op.is_some()).await?;
+
+    if let Some(auth_param) = auth_op {
+        auth(stream, &auth_param.username, &auth_param.password).await?;
+    };
+
+    accept(stream, peer_addr).await
+}
+
+pub async fn socks5_server_start(
+    config: Socks5,
+    tls_config: Option<ServerConfig>,
+) -> Result<()> {
+    let tls_acceptor = tls_config.map(|tls_config| TlsAcceptor::from(Arc::new(tls_config)));
     let listener = TcpListener::bind(config.bind_addr).await?;
     info!("Listening on socks5://{}", listener.local_addr()?);
-
-    let username_op = config.username;
-    let password_op = config.password;
-    let is_auth = username_op.is_some() && password_op.is_some();
+    let auth_op = config.auth;
 
     while let Ok((mut stream, peer_addr)) = listener.accept().await {
-        let inner_username_op = username_op.clone();
-        let inner_password_op = password_op.clone();
+        let auth_op = auth_op.clone();
+        let inner_tls_acceptor = tls_acceptor.clone();
 
         tokio::spawn(async move {
             let res = async move {
                 stream.set_keepalive()?;
-                negotiate(&mut stream, is_auth).await?;
 
-                if is_auth {
-                    let username = inner_username_op.unwrap();
-                    let password = inner_password_op.unwrap();
-
-                    auth(&mut stream, &username, &password).await?;
+                match inner_tls_acceptor {
+                    Some(acceptor) => {
+                        let mut tls_stream = acceptor.accept(stream).await?;
+                        socks5_codec(&mut tls_stream, peer_addr, auth_op).await
+                    }
+                    None => socks5_codec(&mut stream, peer_addr, auth_op).await
                 }
-
-                accept(&mut stream, peer_addr).await
             };
 
             if let Err(e) = res.await {

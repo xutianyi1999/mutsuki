@@ -1,58 +1,96 @@
 use std::convert::Infallible;
+use std::io;
+use std::option::Option::Some;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
+use futures_util::{FutureExt, Stream, TryFutureExt};
 use hyper::{Body, Client, http, Method, Request, Response, Server};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::upgrade::Upgraded;
 use tokio::io::Result;
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::server::TlsStream;
 
+use async_stream::stream;
+
+use crate::{Auth, Http};
 use crate::common::{StdResAutoConvert, TcpSocketExt};
-use crate::HttpConfig;
 
 type HttpClient = Client<hyper::client::HttpConnector>;
 
-pub async fn http_server_start(config: HttpConfig) -> Result<()> {
+struct HttpProxyServer {}
+
+pub async fn http_server_start(
+    config: Http,
+    tls_config: Option<ServerConfig>,
+) -> Result<()> {
     let client = Client::builder()
         .http1_title_case_headers(true)
         .http1_preserve_header_case(true)
         .build_http();
 
-    let username_op = config.username;
-    let password_op = config.password;
+    let auth_opt = config.auth;
 
     let make_service = make_service_fn(move |_| {
         let client = client.clone();
-        let username_op = username_op.clone();
-        let password_op = password_op.clone();
 
         async move {
             Ok::<_, Infallible>(
                 service_fn(move |req| proxy(
                     client.clone(),
                     req,
-                    username_op.clone(),
-                    password_op.clone(),
+                    None,
                 ))
             )
         }
     });
 
-    let server = Server::bind(&config.bind_addr)
-        .http1_preserve_header_case(true)
-        .http1_title_case_headers(true)
-        .serve(make_service);
+    match tls_config {
+        Some(tls_config) => {
+            let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+            let tcp = TcpListener::bind(config.bind_addr).await?;
 
-    info!("Listening on http://{}", server.local_addr());
-    server.await.res_auto_convert()
+            let incoming_tls_stream = stream! {
+                loop {
+                    let (socket, _) = tcp.accept().await?;
+                      let stream = acceptor.accept(socket).map_err(|e| {
+                        println!("[!] Voluntary server halt due to client-connection error...");
+                        // Errors could be handled here, instead of server aborting.
+                        // Ok(None)
+                        error(format!("TLS Error: {:?}", e))
+                    });
+                    yield stream.await;
+                }
+            };
+            // Server::builder(HyperAcceptor {
+            //     acceptor: Box::pin(incoming_tls_stream),
+            // })
+            //     .http1_preserve_header_case(true)
+            //     .http1_title_case_headers(true)
+            //     .serve(make_service).await;
+        }
+        None => {
+            Server::bind(&config.bind_addr)
+                .http1_preserve_header_case(true)
+                .http1_title_case_headers(true)
+                .serve(make_service).await;
+        }
+    };
+    Ok(())
+    // info!("Listening on http://{}", server.local_addr());
+    // server.await.res_auto_convert()
 }
 
 async fn proxy(
     client: HttpClient,
     req: Request<Body>,
-    username_op: Option<String>,
-    password_op: Option<String>,
+    auth_opt: Option<Auth>,
 ) -> Result<Response<Body>> {
-    if !auth(username_op, password_op, &req)? {
+    if !auth(auth_opt, &req)? {
         let mut resp = Response::new(Body::from("Authentication failed"));
         *resp.status_mut() = http::StatusCode::FORBIDDEN;
         return Ok(resp);
@@ -93,13 +131,12 @@ async fn tunnel(mut upgraded: Upgraded, addr: String) -> Result<()> {
 }
 
 fn auth(
-    username_op: Option<String>,
-    password_op: Option<String>,
+    auth_opt: Option<Auth>,
     req: &Request<Body>,
 ) -> Result<bool> {
-    if username_op.is_some() && password_op.is_some() {
-        let username = username_op.unwrap();
-        let password = password_op.unwrap();
+    if let Some(auth) = auth_opt {
+        let username = auth.username;
+        let password = auth.password;
 
         match req.headers().get("Proxy-Authorization") {
             Some(head_value) => {
@@ -133,3 +170,24 @@ fn auth(
         Ok(true)
     }
 }
+
+struct HyperAcceptor<'a> {
+    acceptor: Pin<Box<dyn Stream<Item=std::result::Result<TlsStream<TcpStream>, io::Error>> + 'a>>,
+}
+
+impl hyper::server::accept::Accept for HyperAcceptor<'_> {
+    type Conn = TlsStream<TcpStream>;
+    type Error = io::Error;
+
+    fn poll_accept(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context,
+    ) -> Poll<Option<std::result::Result<Self::Conn, Self::Error>>> {
+        Pin::new(&mut self.acceptor).poll_next(cx)
+    }
+}
+
+fn error(err: String) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, err)
+}
+
