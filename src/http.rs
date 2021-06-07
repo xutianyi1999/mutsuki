@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::time::Duration;
 
 use hyper::{Body, Client, http, Method, Request, Response, Server};
 use hyper::service::{make_service_fn, service_fn};
@@ -38,6 +39,7 @@ pub async fn http_server_start(config: HttpConfig) -> Result<()> {
     });
 
     let server = Server::bind(&config.bind_addr)
+        .tcp_keepalive(Some(Duration::from_secs(120)))
         .http1_preserve_header_case(true)
         .http1_title_case_headers(true)
         .serve(make_service);
