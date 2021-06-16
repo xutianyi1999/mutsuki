@@ -1,5 +1,4 @@
 use socket2::{Socket, TcpKeepalive};
-use tokio::io::{Error, ErrorKind, Result};
 use tokio::net::TcpStream;
 use tokio::time::Duration;
 

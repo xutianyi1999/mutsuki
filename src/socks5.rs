@@ -7,11 +7,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ErrorKind};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 
-use crate::{Auth, load_tls_config, ProxyConfig, ProxyServer, ServerCertKey};
+use crate::{Auth, load_tls_config, ProxyConfig, ProxyServer};
 use crate::common::TcpSocketExt;
 
 pub const SOCKS5_VERSION: u8 = 0x05;
@@ -27,7 +26,7 @@ pub struct Socks5ProxyServer {
 
 #[async_trait]
 impl ProxyServer for Socks5ProxyServer {
-    async fn start(&self) -> Result<(), Box<dyn Error>> {
+    async fn start(self: Box<Self>) -> Result<(), Box<dyn Error>> {
         server_start(self.bind_addr, self.auth, None).await
     }
 }
@@ -46,14 +45,14 @@ pub struct Socks5OverTlsProxyServer {
 
 #[async_trait]
 impl ProxyServer for Socks5OverTlsProxyServer {
-    async fn start(&self) -> Result<(), Box<dyn Error>> {
+    async fn start(self: Box<Self>) -> Result<(), Box<dyn Error>> {
         server_start(self.bind_addr, self.auth, Some(self.tls_acceptor)).await
     }
 }
 
 impl Socks5OverTlsProxyServer {
     pub fn new(config: ProxyConfig) -> Result<Self, Box<dyn Error>> {
-        let server_cert_key = config.server_cert_key.ok_or(Err(io::Error::new(ErrorKind::Other, "socks5 tls server certificate is missing")))?;
+        let server_cert_key = config.server_cert_key.ok_or(io::Error::new(ErrorKind::Other, "socks5 tls server certificate is missing"))?;
         let tls_config = load_tls_config(server_cert_key, config.client_cert_path)?;
         let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
@@ -145,7 +144,7 @@ async fn negotiate<RW: AsyncRead + MsgWrite + Send>(stream: &mut RW, is_auth: bo
     let negotiate_req = NegotiateRequest::decode(stream).await?;
 
     if negotiate_req.version != SOCKS5_VERSION {
-        return Err(Error::new(ErrorKind::Other, "Invalid protocol version"));
+        return Err(Box::new(io::Error::new(ErrorKind::Other, "Invalid protocol version")));
     };
 
     let op = if is_auth {
@@ -401,7 +400,9 @@ impl Encode for AcceptResponse {
 }
 
 async fn accept<RW: AsyncRead + MsgWrite + Send>(stream: &mut RW, peer_addr: SocketAddr) -> Result<(), Box<dyn Error>> {
-    let request = match AcceptRequest::decode(stream).await? {
+    let op = AcceptRequest::decode(stream).await?;
+
+    let request = match op {
         Some(accept_request) => accept_request,
         None => {
             let address_type_not_supported = 0x08;
@@ -430,7 +431,7 @@ async fn accept<RW: AsyncRead + MsgWrite + Send>(stream: &mut RW, peer_addr: Soc
     Ok(())
 }
 
-async fn tcp_handle<RW: AsyncRead + MsgWrite + Send>(stream: &mut RW, request: AcceptRequest) -> io::Result<()> {
+async fn tcp_handle<RW: AsyncRead + MsgWrite + Send>(stream: &mut RW, request: AcceptRequest) -> Result<(), Box<dyn Error>> {
     let res = match request.dest_addr {
         Socks5Addr::Ip(ip) => TcpStream::connect((ip, request.port)).await,
         Socks5Addr::DomainName(domain_name) => TcpStream::connect((domain_name, request.port)).await
@@ -452,7 +453,7 @@ async fn tcp_handle<RW: AsyncRead + MsgWrite + Send>(stream: &mut RW, request: A
 
             let resp = build_err_resp(err_code);
             stream.write_msg(resp).await?;
-            return Err(err);
+            return Err(Box::new(err));
         }
     };
 
@@ -573,7 +574,7 @@ impl UdpProxyPacket<'_> {
     }
 }
 
-async fn udp_handle<RW: AsyncRead + MsgWrite + Send>(stream: &mut RW, peer_addr: SocketAddr) -> io::Result<()> {
+async fn udp_handle<RW: AsyncRead + MsgWrite + Send>(stream: &mut RW, peer_addr: SocketAddr) -> Result<(), Box<dyn Error>> {
     let udp_socket = UdpSocket::bind(SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0)).await?;
 
     let local_addr = udp_socket.local_addr()?;

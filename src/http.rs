@@ -3,21 +3,15 @@ use std::error::Error;
 use std::io;
 use std::net::SocketAddr;
 use std::option::Option::Some;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures_util::{FutureExt, Stream, TryFutureExt};
-use futures_util::ready;
 use hyper::{Body, Client, http, Method, Request, Response, Server};
-use hyper::server::accept::Accept;
-use hyper::server::conn::{AddrIncoming, AddrStream};
+use hyper::server::conn::AddrIncoming;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::upgrade::Upgraded;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio_rustls::rustls::ServerConfig;
 
 use crate::{Auth, load_tls_config, ProxyConfig, ProxyServer};
@@ -33,7 +27,7 @@ pub struct HttpProxyServer {
 
 #[async_trait]
 impl ProxyServer for HttpProxyServer {
-    async fn start(&self) -> Result<(), Box<dyn Error>> {
+    async fn start(self: Box<Self>) -> Result<(), Box<dyn Error>> {
         let client = Client::builder()
             .http1_title_case_headers(true)
             .http1_preserve_header_case(true)
@@ -83,7 +77,7 @@ pub struct HttpsProxyServer {
 
 #[async_trait]
 impl ProxyServer for HttpsProxyServer {
-    async fn start(&self) -> Result<(), Box<dyn Error>> {
+    async fn start(self: Box<Self>) -> Result<(), Box<dyn Error>> {
         let client = Client::builder()
             .http1_title_case_headers(true)
             .http1_preserve_header_case(true)
@@ -92,14 +86,19 @@ impl ProxyServer for HttpsProxyServer {
         let addr_incoming = AddrIncoming::bind(&self.bind_addr)?;
         let acceptor = TlsAcceptor::new(self.tls_config.clone(), addr_incoming);
 
-        let service = make_service_fn(|_| async {
-            Ok::<_, io::Error>(service_fn(move |req| {
-                proxy(
-                    client.clone(),
-                    req,
-                    self.auth.clone(),
-                )
-            }))
+        let service = make_service_fn(move |_| {
+            let client = client.clone();
+            let auth = self.auth.clone();
+
+            async move {
+                Ok::<_, io::Error>(service_fn(move |req| {
+                    proxy(
+                        client.clone(),
+                        req,
+                        auth.clone(),
+                    )
+                }))
+            }
         });
 
         Server::builder(acceptor).serve(service).await?;
@@ -109,7 +108,7 @@ impl ProxyServer for HttpsProxyServer {
 
 impl HttpsProxyServer {
     pub fn new(config: ProxyConfig) -> Result<Self, Box<dyn Error>> {
-        let server_cert_key = config.server_cert_key.ok_or(Err(io::Error::new(io::ErrorKind::Other, "server certificate is missing")))?;
+        let server_cert_key = config.server_cert_key.ok_or(io::Error::new(io::ErrorKind::Other, "server certificate is missing"))?;
         let tls_config = load_tls_config(server_cert_key, config.client_cert_path)?;
 
         let https_proxy_server = HttpsProxyServer {
@@ -125,34 +124,39 @@ async fn proxy(
     client: HttpClient,
     req: Request<Body>,
     auth_opt: Option<Auth>,
-) -> Result<Response<Body>, Box<dyn Error>> {
-    if !auth(auth_opt, &req)? {
-        let mut resp = Response::new(Body::from("Authentication failed"));
-        *resp.status_mut() = http::StatusCode::FORBIDDEN;
-        return Ok(resp);
-    }
-
-    if Method::CONNECT == req.method() {
-        if let Some(addr) = host_addr(req.uri()) {
-            tokio::task::spawn(async move {
-                let res = async move {
-                    let upgraded = hyper::upgrade::on(req).await?;
-                    tunnel(upgraded, addr).await
-                };
-
-                if let Err(e) = res.await {
-                    error!("{}", e)
-                }
-            });
-            Ok(Response::new(Body::empty()))
-        } else {
-            let mut resp = Response::new(Body::from("Connect must be to a socket address"));
-            *resp.status_mut() = http::StatusCode::BAD_REQUEST;
-            Ok(resp)
+) -> io::Result<Response<Body>> {
+    let res = async move {
+        if !auth(auth_opt, &req)? {
+            let mut resp = Response::new(Body::from("Authentication failed"));
+            *resp.status_mut() = http::StatusCode::FORBIDDEN;
+            return Ok::<Response<Body>, Box<dyn Error>>(resp);
         }
-    } else {
-        client.request(req).await?;
-    }
+
+        if Method::CONNECT == req.method() {
+            if let Some(addr) = host_addr(req.uri()) {
+                tokio::task::spawn(async move {
+                    let res: Result<(), Box<dyn Error>> = async move {
+                        let upgraded = hyper::upgrade::on(req).await?;
+                        tunnel(upgraded, addr).await?;
+                        Ok(())
+                    }.await;
+
+                    if let Err(e) = res {
+                        error!("{}", e)
+                    }
+                });
+                Ok(Response::new(Body::empty()))
+            } else {
+                let mut resp = Response::new(Body::from("Connect must be to a socket address"));
+                *resp.status_mut() = http::StatusCode::BAD_REQUEST;
+                Ok(resp)
+            }
+        } else {
+            let res = client.request(req).await?;
+            Ok(res)
+        }
+    };
+    res.await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
 }
 
 fn host_addr(uri: &http::Uri) -> Option<String> {
@@ -211,6 +215,7 @@ mod tls {
     use std::sync::Arc;
     use std::task::{Context, Poll};
 
+    use futures_util::Future;
     use futures_util::ready;
     use hyper::server::accept::Accept;
     use hyper::server::conn::{AddrIncoming, AddrStream};

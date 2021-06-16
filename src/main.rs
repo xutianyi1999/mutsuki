@@ -6,10 +6,8 @@ use std::error::Error;
 use std::fs::File;
 use std::io::{BufReader, ErrorKind};
 use std::net::SocketAddr;
-use std::ops::Deref;
 
 use async_trait::async_trait;
-use hyper::body::Buf;
 use log4rs::append::console::ConsoleAppender;
 use log4rs::config::{Appender, Root};
 use log4rs::Config;
@@ -46,7 +44,7 @@ pub struct Auth {
 
 #[async_trait]
 pub trait ProxyServer {
-    async fn start(&self) -> Result<(), Box<dyn Error>>;
+    async fn start(self: Box<Self>) -> Result<(), Box<dyn Error>>;
 }
 
 #[tokio::main]
@@ -88,9 +86,9 @@ async fn process() -> Result<(), Box<dyn Error>> {
 fn match_server_protocol(config: ProxyConfig) -> Result<Box<dyn ProxyServer>, Box<dyn Error>> {
     let p: Box<dyn ProxyServer> = match config.protocol.as_str() {
         "socks5" => Box::new(socks5::Socks5ProxyServer::new(config)),
-        "socks5_over_tls" => Box::new(socks5::Socks5OverTlsProxyServer::new(config)),
+        "socks5_over_tls" => Box::new(socks5::Socks5OverTlsProxyServer::new(config)?),
         "http" => Box::new(http::HttpProxyServer::new(config)),
-        "https" => Box::new(http::HttpsProxyServer::new(config)),
+        "https" => Box::new(http::HttpsProxyServer::new(config)?),
         _ => return Err(Box::new(io::Error::new(ErrorKind::Other, "invalid proxy config")))
     };
     Ok(p)
