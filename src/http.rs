@@ -127,7 +127,7 @@ async fn proxy(
 ) -> io::Result<Response<Body>> {
     let res = async move {
         if !auth(auth_opt, &req)? {
-            let mut resp = Response::new(Body::from("Authentication failed"));
+            let mut resp = Response::new(Body::from("authentication failed"));
             *resp.status_mut() = http::StatusCode::FORBIDDEN;
             return Ok::<Response<Body>, Box<dyn Error>>(resp);
         }
@@ -147,7 +147,7 @@ async fn proxy(
                 });
                 Ok(Response::new(Body::empty()))
             } else {
-                let mut resp = Response::new(Body::from("Connect must be to a socket address"));
+                let mut resp = Response::new(Body::from("connect must be to a socket address"));
                 *resp.status_mut() = http::StatusCode::BAD_REQUEST;
                 Ok(resp)
             }

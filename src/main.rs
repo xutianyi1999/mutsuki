@@ -50,7 +50,11 @@ pub trait ProxyServer {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     logger_init()?;
-    process().await
+
+    if let Err(e) = process().await {
+        error!("{}", e)
+    }
+    Ok(())
 }
 
 async fn process() -> Result<(), Box<dyn Error>> {
@@ -65,16 +69,16 @@ async fn process() -> Result<(), Box<dyn Error>> {
 
     for config in config_list {
         let f = async move {
-            if let Err(e) = match_server(config.clone()).await?.start().await {
-                error!("{} -> {}", config.bind_addr, e)
+            let bind_addr = config.bind_addr;
+
+            if let Err(e) = async move { match_server(config).await?.start().await }.await {
+                error!("{} -> {}", bind_addr, e)
             }
 
-            error!("{} crashed", config.bind_addr);
-            Ok::<(), Box<dyn Error>>(())
+            error!("{} crashed", bind_addr);
         };
         join_list.push(f);
     }
-
 
     futures_util::future::join_all(join_list).await;
     Ok(())
@@ -86,7 +90,7 @@ async fn match_server(config: ProxyConfig) -> Result<Box<dyn ProxyServer>, Box<d
         "socks5_over_tls" => Box::new(socks5::Socks5OverTlsProxyServer::new(config).await?),
         "http" => Box::new(http::HttpProxyServer::new(config)),
         "https" => Box::new(http::HttpsProxyServer::new(config).await?),
-        _ => return Err(Box::new(io::Error::new(ErrorKind::Other, "invalid proxy config")))
+        _ => return Err(Box::new(io::Error::new(ErrorKind::InvalidInput, "invalid proxy protocol")))
     };
     Ok(p)
 }

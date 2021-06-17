@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::result::Result::Err;
 use std::sync::Arc;
 
@@ -575,13 +575,13 @@ impl UdpProxyPacket<'_> {
 }
 
 async fn udp_handle<RW: AsyncRead + MsgWrite + Send>(stream: &mut RW, peer_addr: SocketAddr) -> Result<(), Box<dyn Error>> {
-    let udp_socket = UdpSocket::bind(SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0)).await?;
+    let udp_socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await?;
 
     let local_addr = udp_socket.local_addr()?;
-    let to_peer_ip = get_interface_addr(peer_addr).await?;
+    let local_to_peer_ip = get_interface_addr(peer_addr).await?;
     let success = 0x00;
 
-    let addr_type = match to_peer_ip {
+    let addr_type = match local_to_peer_ip {
         IpAddr::V4(_) => IPV4,
         IpAddr::V6(_) => IPV6
     };
@@ -591,7 +591,7 @@ async fn udp_handle<RW: AsyncRead + MsgWrite + Send>(stream: &mut RW, peer_addr:
         rep: success,
         rsv: 0x00,
         bind_addr_type: addr_type,
-        bind_addr: Socks5Addr::Ip(to_peer_ip),
+        bind_addr: Socks5Addr::Ip(local_to_peer_ip),
         bind_port: local_addr.port(),
     };
 
@@ -613,7 +613,7 @@ async fn udp_handle<RW: AsyncRead + MsgWrite + Send>(stream: &mut RW, peer_addr:
             if peer_addr == source_addr {
                 proxy_server_to_dest(&buff[..len], &udp_socket).await?;
             } else {
-                let addr_type = match to_peer_ip {
+                let addr_type = match peer_addr.ip() {
                     IpAddr::V4(_) => IPV4,
                     IpAddr::V6(_) => IPV6
                 };
@@ -661,7 +661,7 @@ fn build_err_resp(rep: u8) -> AcceptResponse {
 }
 
 async fn get_interface_addr(dest_addr: SocketAddr) -> io::Result<IpAddr> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await?;
     socket.connect(dest_addr).await?;
     let addr = socket.local_addr()?;
     Ok(addr.ip())
@@ -677,7 +677,6 @@ async fn socks5_codec<RW: AsyncRead + MsgWrite + Send>(
     if let Some(auth_param) = auth_op {
         auth(stream, &auth_param.username, &auth_param.password).await?;
     };
-
     accept(stream, peer_addr).await
 }
 
