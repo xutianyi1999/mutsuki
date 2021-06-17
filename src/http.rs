@@ -107,9 +107,9 @@ impl ProxyServer for HttpsProxyServer {
 }
 
 impl HttpsProxyServer {
-    pub fn new(config: ProxyConfig) -> Result<Self, Box<dyn Error>> {
+    pub async fn new(config: ProxyConfig) -> Result<Self, Box<dyn Error>> {
         let server_cert_key = config.server_cert_key.ok_or(io::Error::new(io::ErrorKind::Other, "server certificate is missing"))?;
-        let tls_config = load_tls_config(server_cert_key, config.client_cert_path)?;
+        let tls_config = load_tls_config(server_cert_key, config.client_cert_path).await?;
 
         let https_proxy_server = HttpsProxyServer {
             bind_addr: config.bind_addr,
