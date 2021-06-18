@@ -14,8 +14,8 @@ use hyper::upgrade::Upgraded;
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::ServerConfig;
 
-use crate::{Auth, load_tls_config, ProxyConfig, ProxyServer};
-use crate::common::TcpSocketExt;
+use crate::{Auth, ProxyConfig, ProxyServer};
+use crate::common::{load_tls_config, TcpSocketExt};
 use crate::http::tls::TlsAcceptor;
 
 type HttpClient = Client<hyper::client::HttpConnector>;
@@ -83,12 +83,15 @@ impl ProxyServer for HttpsProxyServer {
             .http1_preserve_header_case(true)
             .build_http();
 
-        let addr_incoming = AddrIncoming::bind(&self.bind_addr)?;
-        let acceptor = TlsAcceptor::new(self.tls_config.clone(), addr_incoming);
+        let bind_addr = self.bind_addr;
+        let auth = self.auth;
+
+        let addr_incoming = AddrIncoming::bind(&bind_addr)?;
+        let acceptor = TlsAcceptor::new(self.tls_config, addr_incoming);
 
         let service = make_service_fn(move |_| {
             let client = client.clone();
-            let auth = self.auth.clone();
+            let auth = auth.clone();
 
             async move {
                 Ok::<_, io::Error>(service_fn(move |req| {
@@ -101,14 +104,16 @@ impl ProxyServer for HttpsProxyServer {
             }
         });
 
-        Server::builder(acceptor).serve(service).await?;
+        let server = Server::builder(acceptor).serve(service);
+        info!("Listening on https://{}", bind_addr);
+        server.await?;
         Ok(())
     }
 }
 
 impl HttpsProxyServer {
     pub async fn new(config: ProxyConfig) -> Result<Self, Box<dyn Error>> {
-        let server_cert_key = config.server_cert_key.ok_or(io::Error::new(io::ErrorKind::Other, "server certificate is missing"))?;
+        let server_cert_key = config.server_cert_key.ok_or(io::Error::new(io::ErrorKind::Other, "server_certificate certificate is missing"))?;
         let tls_config = load_tls_config(server_cert_key, config.client_cert_path).await?;
 
         let https_proxy_server = HttpsProxyServer {

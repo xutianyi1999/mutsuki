@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::result::Result::Err;
 use std::sync::Arc;
 
@@ -10,8 +10,8 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 
-use crate::{Auth, load_tls_config, ProxyConfig, ProxyServer};
-use crate::common::TcpSocketExt;
+use crate::{Auth, ProxyConfig, ProxyServer};
+use crate::common::{load_tls_config, TcpSocketExt};
 
 pub const SOCKS5_VERSION: u8 = 0x05;
 
@@ -27,6 +27,7 @@ pub struct Socks5ProxyServer {
 #[async_trait]
 impl ProxyServer for Socks5ProxyServer {
     async fn start(self: Box<Self>) -> Result<(), Box<dyn Error>> {
+        info!("Listening on socks5://{}", self.bind_addr);
         server_start(self.bind_addr, self.auth, None).await
     }
 }
@@ -46,13 +47,14 @@ pub struct Socks5OverTlsProxyServer {
 #[async_trait]
 impl ProxyServer for Socks5OverTlsProxyServer {
     async fn start(self: Box<Self>) -> Result<(), Box<dyn Error>> {
+        info!("Listening on socks5 over tls://{}", self.bind_addr);
         server_start(self.bind_addr, self.auth, Some(self.tls_acceptor)).await
     }
 }
 
 impl Socks5OverTlsProxyServer {
     pub async fn new(config: ProxyConfig) -> Result<Self, Box<dyn Error>> {
-        let server_cert_key = config.server_cert_key.ok_or(io::Error::new(ErrorKind::Other, "socks5 tls server certificate is missing"))?;
+        let server_cert_key = config.server_cert_key.ok_or(io::Error::new(ErrorKind::Other, "socks5 tls server_certificate certificate is missing"))?;
         let tls_config = load_tls_config(server_cert_key, config.client_cert_path).await?;
         let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 

@@ -1,12 +1,11 @@
-{
-  "socks5": {
-    "bind_addr": "127.0.0.1:19999",
-    "username": "abc",
-    "password": "123"
-  },
-  "http": {
+[
+  {
+    "protocol": "https",
     "bind_addr": "127.0.0.1:10800",
-    "username": "abc",
-    "password": "123"
+    "server_cert_key": {
+      "cert_path": "cfg-example/server_certificate/cert.pem",
+      "priv_key_path": "cfg-example/server_certificate/priv.key"
+    },
+    "client_cert_path": "cfg-example/client_certificate/cert.pem"
   }
-}
+]
