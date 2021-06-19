@@ -59,7 +59,7 @@ async fn process() -> Result<(), Box<dyn Error>> {
     let mut args = env::args();
     args.next();
 
-    let config_path = args.next().ok_or(io::Error::new(ErrorKind::InvalidInput, "command invalid"))?;
+    let config_path = args.next().ok_or(io::Error::new(ErrorKind::InvalidInput, "Command invalid"))?;
     let json = fs::read(config_path).await?;
     let config_list: Vec<ProxyConfig> = serde_json::from_slice(&json)?;
 
@@ -88,7 +88,7 @@ async fn match_server(config: ProxyConfig) -> Result<Box<dyn ProxyServer>, Box<d
         "socks5_over_tls" => Box::new(socks5::Socks5OverTlsProxyServer::new(config).await?),
         "http" => Box::new(http::HttpProxyServer::new(config)),
         "https" => Box::new(http::HttpsProxyServer::new(config).await?),
-        _ => return Err(Box::new(io::Error::new(ErrorKind::InvalidInput, "invalid proxy protocol")))
+        _ => return Err(Box::new(io::Error::new(ErrorKind::InvalidInput, "Invalid proxy protocol")))
     };
     Ok(p)
 }

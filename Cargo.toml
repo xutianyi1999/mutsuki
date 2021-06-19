@@ -17,6 +17,5 @@ hyper = { version = "0.14", features = ["full"] }
 base64 = "0.13"
 socket2 = "0.4"
 tokio-rustls = "0.22"
-hyper-rustls = "0.22"
-futures-util = { version = "0.3" }
+futures-util = "0.3"
 

@@ -86,7 +86,9 @@ impl ProxyServer for HttpsProxyServer {
         let bind_addr = self.bind_addr;
         let auth = self.auth;
 
-        let addr_incoming = AddrIncoming::bind(&bind_addr)?;
+        let mut addr_incoming = AddrIncoming::bind(&bind_addr)?;
+        addr_incoming.set_keepalive(Some(Duration::from_secs(120)));
+
         let acceptor = TlsAcceptor::new(self.tls_config, addr_incoming);
 
         let service = make_service_fn(move |_| {
@@ -104,7 +106,11 @@ impl ProxyServer for HttpsProxyServer {
             }
         });
 
-        let server = Server::builder(acceptor).serve(service);
+        let server = Server::builder(acceptor)
+            .http1_preserve_header_case(true)
+            .http1_title_case_headers(true)
+            .serve(service);
+
         info!("Listening on https://{}", bind_addr);
         server.await?;
         Ok(())
@@ -113,7 +119,7 @@ impl ProxyServer for HttpsProxyServer {
 
 impl HttpsProxyServer {
     pub async fn new(config: ProxyConfig) -> Result<Self, Box<dyn Error>> {
-        let server_cert_key = config.server_cert_key.ok_or(io::Error::new(io::ErrorKind::Other, "server_certificate certificate is missing"))?;
+        let server_cert_key = config.server_cert_key.ok_or(io::Error::new(io::ErrorKind::Other, "Server certificate is missing"))?;
         let tls_config = load_tls_config(server_cert_key, config.client_cert_path).await?;
 
         let https_proxy_server = HttpsProxyServer {
@@ -132,7 +138,7 @@ async fn proxy(
 ) -> io::Result<Response<Body>> {
     let res = async move {
         if !auth(auth_opt, &req)? {
-            let mut resp = Response::new(Body::from("authentication failed"));
+            let mut resp = Response::new(Body::from("Authentication failed"));
             *resp.status_mut() = http::StatusCode::FORBIDDEN;
             return Ok::<Response<Body>, Box<dyn Error>>(resp);
         }
@@ -152,7 +158,7 @@ async fn proxy(
                 });
                 Ok(Response::new(Body::empty()))
             } else {
-                let mut resp = Response::new(Body::from("connect must be to a socket address"));
+                let mut resp = Response::new(Body::from("Connect must be to a socket address"));
                 *resp.status_mut() = http::StatusCode::BAD_REQUEST;
                 Ok(resp)
             }
