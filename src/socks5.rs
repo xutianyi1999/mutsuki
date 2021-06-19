@@ -54,7 +54,7 @@ impl ProxyServer for Socks5OverTlsProxyServer {
 
 impl Socks5OverTlsProxyServer {
     pub async fn new(config: ProxyConfig) -> Result<Self, Box<dyn Error>> {
-        let server_cert_key = config.server_cert_key.ok_or(io::Error::new(ErrorKind::Other, "Socks5 tls server certificate is missing"))?;
+        let server_cert_key = config.server_cert_key.ok_or_else(|| io::Error::new(ErrorKind::Other, "Socks5 tls server certificate is missing"))?;
         let tls_config = load_tls_config(server_cert_key, config.client_cert_path).await?;
         let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 

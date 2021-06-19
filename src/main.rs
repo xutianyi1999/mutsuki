@@ -59,7 +59,7 @@ async fn process() -> Result<(), Box<dyn Error>> {
     let mut args = env::args();
     args.next();
 
-    let config_path = args.next().ok_or(io::Error::new(ErrorKind::InvalidInput, "Command invalid"))?;
+    let config_path = args.next().ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "Command invalid"))?;
     let json = fs::read(config_path).await?;
     let config_list: Vec<ProxyConfig> = serde_json::from_slice(&json)?;
 

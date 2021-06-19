@@ -52,13 +52,13 @@ pub async fn load_tls_config(server_cert_key: ServerCertKey, client_cert_path: O
     let (certs, mut keys) = tokio::try_join!(cert_future, key_future)?;
 
     let mut tls_config = ServerConfig::new(NoClientAuth::new());
-    tls_config.set_single_cert(certs, keys.pop().ok_or(io::Error::new(io::ErrorKind::InvalidInput, "invalid key"))?)?;
+    tls_config.set_single_cert(certs, keys.pop().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid key"))?)?;
 
     if let Some(cert_path) = client_cert_path {
         let mut client_cert = load_certs(&cert_path).await?;
 
         let mut root = RootCertStore::empty();
-        root.add(&client_cert.pop().ok_or(io::Error::new(io::ErrorKind::InvalidInput, "invalid cert"))?)?;
+        root.add(&client_cert.pop().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid cert"))?)?;
 
         tls_config.set_client_certificate_verifier(AllowAnyAuthenticatedClient::new(root));
     };
