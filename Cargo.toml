@@ -19,3 +19,6 @@ socket2 = "0.4"
 tokio-rustls = "0.22"
 futures-util = "0.3"
 
+[profile.release]
+lto = true
+codegen-units = 1
