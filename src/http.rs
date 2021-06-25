@@ -119,7 +119,7 @@ impl ProxyServer for HttpsProxyServer {
 
 impl HttpsProxyServer {
     pub async fn new(config: ProxyConfig) -> Result<Self, Box<dyn Error>> {
-        let server_cert_key = config.server_cert_key.ok_or(io::Error::new(io::ErrorKind::Other, "Server certificate is missing"))?;
+        let server_cert_key = config.server_cert_key.ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Server certificate is missing"))?;
         let tls_config = load_tls_config(server_cert_key, config.client_cert_path).await?;
 
         let https_proxy_server = HttpsProxyServer {
@@ -171,7 +171,7 @@ async fn proxy(
 }
 
 fn host_addr(uri: &http::Uri) -> Option<String> {
-    uri.authority().and_then(|auth| Some(auth.to_string()))
+    uri.authority().map(|auth| auth.to_string())
 }
 
 async fn tunnel(mut upgraded: Upgraded, addr: String) -> io::Result<()> {
@@ -200,17 +200,11 @@ fn auth(
                 let username_temp_op = res.next();
                 let password_temp_op = res.next();
 
-                if username_temp_op.is_some() && password_temp_op.is_some() {
-                    let username_temp = username_temp_op.unwrap();
-                    let password_temp = password_temp_op.unwrap();
-
-                    if username_temp == username && password_temp == password {
-                        Ok(true)
-                    } else {
-                        Ok(false)
+                match (username_temp_op, password_temp_op) {
+                    (Some(username_temp), Some(password_temp)) => {
+                        Ok(username_temp == username && password_temp == password)
                     }
-                } else {
-                    Ok(false)
+                    _ => Ok(false)
                 }
             }
             None => Ok(false)
