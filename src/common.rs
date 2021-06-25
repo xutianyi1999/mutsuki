@@ -28,10 +28,8 @@ fn set_keepalive<S: std::os::windows::io::AsRawSocket>(socket: &S) -> tokio::io:
 
     unsafe {
         let socket = Socket::from_raw_socket(socket.as_raw_socket());
-        socket.set_tcp_keepalive(&TCP_KEEPALIVE)?;
-        std::mem::forget(socket);
-    };
-    Ok(())
+        socket.set_tcp_keepalive(&TCP_KEEPALIVE)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -40,10 +38,8 @@ fn set_keepalive<S: std::os::unix::io::AsRawFd>(socket: &S) -> tokio::io::Result
 
     unsafe {
         let socket = Socket::from_raw_fd(socket.as_raw_fd());
-        socket.set_tcp_keepalive(&TCP_KEEPALIVE)?;
-        std::mem::forget(socket);
-    };
-    Ok(())
+        socket.set_tcp_keepalive(&TCP_KEEPALIVE)
+    }
 }
 
 pub async fn load_tls_config(server_cert_key: ServerCertKey, client_cert_path: Option<String>) -> Result<ServerConfig, Box<dyn Error>> {
