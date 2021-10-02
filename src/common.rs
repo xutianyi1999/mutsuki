@@ -22,7 +22,7 @@ impl TcpSocketExt for TcpStream {
 
 const TCP_KEEPALIVE: TcpKeepalive = TcpKeepalive::new().with_time(Duration::from_secs(120));
 
-#[cfg(target_os = "windows")]
+#[cfg(windows)]
 fn set_keepalive<S: std::os::windows::io::AsRawSocket>(socket: &S) -> tokio::io::Result<()> {
     use std::os::windows::io::FromRawSocket;
 
@@ -34,7 +34,7 @@ fn set_keepalive<S: std::os::windows::io::AsRawSocket>(socket: &S) -> tokio::io:
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn set_keepalive<S: std::os::unix::io::AsRawFd>(socket: &S) -> tokio::io::Result<()> {
     use std::os::unix::io::FromRawFd;
 
