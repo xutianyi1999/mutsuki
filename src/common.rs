@@ -5,8 +5,8 @@ use socket2::{Socket, TcpKeepalive};
 use tokio::fs;
 use tokio::net::TcpStream;
 use tokio::time::Duration;
-use tokio_rustls::rustls::{AllowAnyAuthenticatedClient, Certificate, NoClientAuth, PrivateKey, RootCertStore, ServerConfig};
-use tokio_rustls::rustls::internal::pemfile;
+use tokio_rustls::rustls::{Certificate, PrivateKey, RootCertStore, ServerConfig};
+use tokio_rustls::rustls::server::AllowAnyAuthenticatedClient;
 
 use crate::ServerCertKey;
 
@@ -51,32 +51,44 @@ pub async fn load_tls_config(server_cert_key: ServerCertKey, client_cert_path: O
     let key_future = load_keys(&server_cert_key.priv_key_path);
     let (certs, mut keys) = tokio::try_join!(cert_future, key_future)?;
 
-    let mut tls_config = ServerConfig::new(NoClientAuth::new());
-    tls_config.set_single_cert(certs, keys.pop().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid key"))?)?;
+    let builder = ServerConfig::builder().with_safe_defaults();
 
-    if let Some(cert_path) = client_cert_path {
+    let builder = if let Some(cert_path) = client_cert_path {
         let mut client_cert = load_certs(&cert_path).await?;
 
         let mut root = RootCertStore::empty();
         root.add(&client_cert.pop().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid cert"))?)?;
 
-        tls_config.set_client_certificate_verifier(AllowAnyAuthenticatedClient::new(root));
+        builder.with_client_cert_verifier(AllowAnyAuthenticatedClient::new(root))
+    } else {
+        builder.with_no_client_auth()
     };
-    Ok(tls_config)
+
+    let key = keys.pop().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid key"))?;
+    let builder = builder.with_single_cert(certs, key)?;
+    Ok(builder)
 }
 
 async fn load_certs(path: &str) -> io::Result<Vec<Certificate>> {
     let certs_buff = fs::read(path).await?;
     let mut buff: &[u8] = &certs_buff;
 
-    pemfile::certs(&mut buff)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid cert"))
+    rustls_pemfile::certs(&mut buff)
+        .map(|certs| {
+            certs.into_iter()
+                .map(Certificate)
+                .collect()
+        })
 }
 
 async fn load_keys(path: &str) -> io::Result<Vec<PrivateKey>> {
     let keys_buff = fs::read(path).await?;
     let mut buff: &[u8] = &keys_buff;
 
-    pemfile::pkcs8_private_keys(&mut buff)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid key"))
+    rustls_pemfile::pkcs8_private_keys(&mut buff)
+        .map(|keys| {
+            keys.into_iter()
+                .map(PrivateKey)
+                .collect()
+        })
 }
