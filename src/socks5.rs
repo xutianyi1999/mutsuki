@@ -1,10 +1,12 @@
 use std::error::Error;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::result::Result::Err;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ErrorKind};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::server::TlsStream;
@@ -661,9 +663,10 @@ fn build_err_resp(rep: u8) -> AcceptResponse {
 }
 
 async fn get_interface_addr(dest_addr: SocketAddr) -> io::Result<IpAddr> {
-    let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await?;
-    socket.connect(dest_addr).await?;
-    let addr = socket.local_addr()?;
+    static SOCKET: Lazy<Mutex<std::net::UdpSocket>> = Lazy::new(|| Mutex::new(std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).unwrap()));
+    let guard = SOCKET.lock();
+    guard.connect(dest_addr)?;
+    let addr = guard.local_addr()?;
     Ok(addr.ip())
 }
 
