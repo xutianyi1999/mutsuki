@@ -22,7 +22,7 @@ type HttpClient = Client<hyper::client::HttpConnector>;
 
 pub struct HttpProxyServer {
     bind_addr: SocketAddr,
-    auth: Option<Auth>,
+    auth: Option<Arc<Auth>>,
 }
 
 impl ProxyServer for HttpProxyServer {
@@ -62,14 +62,14 @@ impl HttpProxyServer {
     pub fn new(config: ProxyConfig) -> Self {
         HttpProxyServer {
             bind_addr: config.bind_addr,
-            auth: config.auth,
+            auth: config.auth.map(Arc::new),
         }
     }
 }
 
 pub struct HttpsProxyServer {
     bind_addr: SocketAddr,
-    auth: Option<Auth>,
+    auth: Option<Arc<Auth>>,
     tls_config: Arc<ServerConfig>,
 }
 
@@ -123,7 +123,7 @@ impl HttpsProxyServer {
 
         let https_proxy_server = HttpsProxyServer {
             bind_addr: config.bind_addr,
-            auth: config.auth,
+            auth: config.auth.map(Arc::new),
             tls_config: Arc::new(tls_config),
         };
         Ok(https_proxy_server)
@@ -133,10 +133,10 @@ impl HttpsProxyServer {
 async fn proxy(
     client: HttpClient,
     req: Request<Body>,
-    auth_opt: Option<Auth>,
+    auth_opt: Option<Arc<Auth>>,
 ) -> io::Result<Response<Body>> {
     let res = async move {
-        if !auth(auth_opt, &req)? {
+        if !auth(auth_opt.as_deref(), &req)? {
             let mut resp = Response::new(Body::from("Authentication failed"));
             *resp.status_mut() = http::StatusCode::FORBIDDEN;
             return Ok::<Response<Body>, Box<dyn Error>>(resp);
@@ -182,16 +182,21 @@ async fn tunnel(mut upgraded: Upgraded, addr: String) -> io::Result<()> {
     Ok(())
 }
 
-fn auth(auth_opt: Option<Auth>, req: &Request<Body>) -> Result<bool, Box<dyn Error>> {
+fn auth(auth_opt: Option<&Auth>, req: &Request<Body>) -> Result<bool, Box<dyn Error>> {
     if let Some(auth) = auth_opt {
-        let username = auth.username;
-        let password = auth.password;
+        let username = auth.username.as_str();
+        let password = auth.password.as_str();
 
         match req.headers().get("Proxy-Authorization") {
             Some(head_value) => {
                 let head_str = head_value.to_str()?;
-                let slice = &head_str[6..];
-                let username_and_password = String::from_utf8(base64::decode(slice)?)?;
+                let (_, value) = sscanf::scanf!(head_str, "{} {}", str, str).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Parse Proxy-Authorization failed",
+                    )
+                })?;
+                let username_and_password = String::from_utf8(base64::decode(value)?)?;
 
                 let mut res = username_and_password.split(':');
 

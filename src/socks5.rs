@@ -691,14 +691,20 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin> Socks5Handler<'a, RW> {
             let (len, source_addr) = udp_socket.recv_from(&mut *buff).await?;
             proxy_server_to_dest(&buff[..len], &udp_socket).await?;
 
-            let data_range_start =  match udp_socket.local_addr()?.ip() {
+            let data_range_start = match udp_socket.local_addr()?.ip() {
                 IpAddr::V4(_) => 10,
-                IpAddr::V6(_) => 22
+                IpAddr::V6(_) => 22,
             };
 
-            while let Ok((len, peer_addr)) = udp_socket.recv_from(&mut buff[data_range_start..]).await {
+            while let Ok((len, peer_addr)) =
+                udp_socket.recv_from(&mut buff[data_range_start..]).await
+            {
                 if peer_addr == source_addr {
-                    proxy_server_to_dest(&buff[data_range_start..data_range_start + len], &udp_socket).await?;
+                    proxy_server_to_dest(
+                        &buff[data_range_start..data_range_start + len],
+                        &udp_socket,
+                    )
+                    .await?;
                 } else {
                     let addr_type = match peer_addr.ip() {
                         IpAddr::V4(_) => IPV4,
