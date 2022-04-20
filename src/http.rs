@@ -6,7 +6,7 @@ use std::option::Option::Some;
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
+use futures_util::TryFutureExt;
 use hyper::{Body, Client, http, Method, Request, Response, Server};
 use hyper::server::conn::AddrIncoming;
 use hyper::service::{make_service_fn, service_fn};
@@ -14,8 +14,8 @@ use hyper::upgrade::Upgraded;
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::ServerConfig;
 
-use crate::{Auth, ProxyConfig, ProxyServer};
-use crate::common::{load_tls_config, TcpSocketExt};
+use crate::{Auth, BoxFuture, ProxyConfig, ProxyServer};
+use crate::common::{load_tls_config, SocketExt};
 use crate::http::tls::TlsAcceptor;
 
 type HttpClient = Client<hyper::client::HttpConnector>;
@@ -25,9 +25,8 @@ pub struct HttpProxyServer {
     auth: Option<Auth>,
 }
 
-#[async_trait]
 impl ProxyServer for HttpProxyServer {
-    async fn start(self: Box<Self>) -> Result<(), Box<dyn Error>> {
+    fn start(self: Box<Self>) -> BoxFuture<io::Result<()>> {
         let client = Client::builder()
             .http1_title_case_headers(true)
             .http1_preserve_header_case(true)
@@ -41,13 +40,9 @@ impl ProxyServer for HttpProxyServer {
             let auth_op = auth.clone();
 
             async move {
-                Ok::<_, Infallible>(
-                    service_fn(move |req| proxy(
-                        client.clone(),
-                        req,
-                        auth_op.clone(),
-                    ))
-                )
+                Ok::<_, Infallible>(service_fn(move |req| {
+                    proxy(client.clone(), req, auth_op.clone())
+                }))
             }
         });
 
@@ -58,14 +53,17 @@ impl ProxyServer for HttpProxyServer {
             .serve(make_service);
 
         info!("Listening on http://{}", server.local_addr());
-        server.await?;
-        Ok(())
+
+        Box::pin(server.map_err(|e| io::Error::new(io::ErrorKind::Other, e)))
     }
 }
 
 impl HttpProxyServer {
     pub fn new(config: ProxyConfig) -> Self {
-        HttpProxyServer { bind_addr: config.bind_addr, auth: config.auth }
+        HttpProxyServer {
+            bind_addr: config.bind_addr,
+            auth: config.auth,
+        }
     }
 }
 
@@ -75,9 +73,8 @@ pub struct HttpsProxyServer {
     tls_config: Arc<ServerConfig>,
 }
 
-#[async_trait]
 impl ProxyServer for HttpsProxyServer {
-    async fn start(self: Box<Self>) -> Result<(), Box<dyn Error>> {
+    fn start(self: Box<Self>) -> BoxFuture<io::Result<()>> {
         let client = Client::builder()
             .http1_title_case_headers(true)
             .http1_preserve_header_case(true)
@@ -85,41 +82,43 @@ impl ProxyServer for HttpsProxyServer {
 
         let bind_addr = self.bind_addr;
         let auth = self.auth;
+        let tls_config = self.tls_config;
 
-        let mut addr_incoming = AddrIncoming::bind(&bind_addr)?;
-        addr_incoming.set_keepalive(Some(Duration::from_secs(120)));
+        let fut = async move {
+            let mut addr_incoming = AddrIncoming::bind(&bind_addr)?;
+            addr_incoming.set_keepalive(Some(Duration::from_secs(120)));
 
-        let acceptor = TlsAcceptor::new(self.tls_config, addr_incoming);
+            let acceptor = TlsAcceptor::new(tls_config, addr_incoming);
 
-        let service = make_service_fn(move |_| {
-            let client = client.clone();
-            let auth = auth.clone();
+            let service = make_service_fn(move |_| {
+                let client = client.clone();
+                let auth = auth.clone();
 
-            async move {
-                Ok::<_, io::Error>(service_fn(move |req| {
-                    proxy(
-                        client.clone(),
-                        req,
-                        auth.clone(),
-                    )
-                }))
-            }
-        });
+                async move {
+                    Ok::<_, io::Error>(service_fn(move |req| {
+                        proxy(client.clone(), req, auth.clone())
+                    }))
+                }
+            });
 
-        let server = Server::builder(acceptor)
-            .http1_preserve_header_case(true)
-            .http1_title_case_headers(true)
-            .serve(service);
+            let server = Server::builder(acceptor)
+                .http1_preserve_header_case(true)
+                .http1_title_case_headers(true)
+                .serve(service);
 
-        info!("Listening on https://{}", bind_addr);
-        server.await?;
-        Ok(())
+            info!("Listening on https://{}", bind_addr);
+            server.await
+        };
+
+        Box::pin(fut.map_err(|e| io::Error::new(io::ErrorKind::Other, e)))
     }
 }
 
 impl HttpsProxyServer {
-    pub async fn new(config: ProxyConfig) -> Result<Self, Box<dyn Error>> {
-        let server_cert_key = config.server_cert_key.ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Server certificate is missing"))?;
+    pub async fn new(config: ProxyConfig) -> io::Result<Self> {
+        let server_cert_key = config
+            .server_cert_key
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Server certificate is missing"))?;
         let tls_config = load_tls_config(server_cert_key, config.client_cert_path).await?;
 
         let https_proxy_server = HttpsProxyServer {
@@ -150,7 +149,8 @@ async fn proxy(
                         let upgraded = hyper::upgrade::on(req).await?;
                         tunnel(upgraded, addr).await?;
                         Ok(())
-                    }.await;
+                    }
+                        .await;
 
                     if let Err(e) = res {
                         error!("{}", e)
@@ -167,7 +167,8 @@ async fn proxy(
             Ok(res)
         }
     };
-    res.await.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    res.await
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
 }
 
 fn host_addr(uri: &http::Uri) -> Option<String> {
@@ -181,10 +182,7 @@ async fn tunnel(mut upgraded: Upgraded, addr: String) -> io::Result<()> {
     Ok(())
 }
 
-fn auth(
-    auth_opt: Option<Auth>,
-    req: &Request<Body>,
-) -> Result<bool, Box<dyn Error>> {
+fn auth(auth_opt: Option<Auth>, req: &Request<Body>) -> Result<bool, Box<dyn Error>> {
     if let Some(auth) = auth_opt {
         let username = auth.username;
         let password = auth.password;
@@ -204,10 +202,10 @@ fn auth(
                     (Some(username_temp), Some(password_temp)) => {
                         Ok(username_temp == username && password_temp == password)
                     }
-                    _ => Ok(false)
+                    _ => Ok(false),
                 }
             }
-            None => Ok(false)
+            None => Ok(false),
         }
     } else {
         Ok(true)
@@ -307,7 +305,10 @@ mod tls {
 
     impl TlsAcceptor {
         pub fn new(config: Arc<ServerConfig>, incoming: AddrIncoming) -> TlsAcceptor {
-            TlsAcceptor { acceptor: tokio_rustls::TlsAcceptor::from(config), incoming }
+            TlsAcceptor {
+                acceptor: tokio_rustls::TlsAcceptor::from(config),
+                incoming,
+            }
         }
     }
 

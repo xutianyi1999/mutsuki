@@ -1,108 +1,102 @@
-use std::error::Error;
+use std::borrow::Cow;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::result::Result::Err;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use once_cell::sync::Lazy;
-use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ErrorKind};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio_rustls::server::TlsStream;
+use tokio::net::{lookup_host, TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::TlsAcceptor;
 
-use crate::{Auth, ProxyConfig, ProxyServer};
-use crate::common::{load_tls_config, TcpSocketExt};
+use crate::{Auth, BoxFuture, ProxyConfig, ProxyServer};
+use crate::common::{PointerWrap, SocketExt};
+use crate::common::load_tls_config;
 
-pub const SOCKS5_VERSION: u8 = 0x05;
-
+const SOCKS5_VERSION: u8 = 0x05;
 const IPV4: u8 = 0x01;
 const DOMAIN_NAME: u8 = 0x03;
 const IPV6: u8 = 0x04;
 
-pub struct Socks5ProxyServer {
-    bind_addr: SocketAddr,
-    auth: Option<Auth>,
+macro_rules! get_mut {
+    ($slice: expr, $index: expr, $error_msg: expr) => {
+        $slice
+            .get_mut($index)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, $error_msg))?
+    };
+    ($slice: expr, $index: expr) => {
+        get_mut!($slice, $index, "Decode failed")
+    };
 }
 
-#[async_trait]
+pub struct Socks5ProxyServer {
+    bind_addr: SocketAddr,
+    auth: Option<Arc<Auth>>,
+}
+
 impl ProxyServer for Socks5ProxyServer {
-    async fn start(self: Box<Self>) -> Result<(), Box<dyn Error>> {
+    fn start(self: Box<Self>) -> BoxFuture<io::Result<()>> {
         info!("Listening on socks5://{}", self.bind_addr);
-        server_start(self.bind_addr, self.auth, None).await
+        Box::pin(server_start(self.bind_addr, self.auth, None))
     }
 }
 
 impl Socks5ProxyServer {
     pub fn new(config: ProxyConfig) -> Self {
-        Socks5ProxyServer { bind_addr: config.bind_addr, auth: config.auth }
+        Socks5ProxyServer {
+            bind_addr: config.bind_addr,
+            auth: config.auth.map(Arc::new),
+        }
     }
 }
 
 pub struct Socks5OverTlsProxyServer {
     bind_addr: SocketAddr,
-    auth: Option<Auth>,
+    auth: Option<Arc<Auth>>,
     tls_acceptor: TlsAcceptor,
 }
 
-#[async_trait]
 impl ProxyServer for Socks5OverTlsProxyServer {
-    async fn start(self: Box<Self>) -> Result<(), Box<dyn Error>> {
+    fn start(self: Box<Self>) -> BoxFuture<io::Result<()>> {
         info!("Listening on socks5 over tls://{}", self.bind_addr);
-        server_start(self.bind_addr, self.auth, Some(self.tls_acceptor)).await
+        Box::pin(server_start(
+            self.bind_addr,
+            self.auth,
+            Some(self.tls_acceptor),
+        ))
     }
 }
 
 impl Socks5OverTlsProxyServer {
-    pub async fn new(config: ProxyConfig) -> Result<Self, Box<dyn Error>> {
-        let server_cert_key = config.server_cert_key.ok_or_else(|| io::Error::new(ErrorKind::Other, "Socks5 tls server certificate is missing"))?;
+    pub async fn new(config: ProxyConfig) -> io::Result<Self> {
+        let server_cert_key = config.server_cert_key.ok_or_else(|| {
+            io::Error::new(ErrorKind::Other, "Socks5 tls server certificate is missing")
+        })?;
         let tls_config = load_tls_config(server_cert_key, config.client_cert_path).await?;
         let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
         let server = Socks5OverTlsProxyServer {
             bind_addr: config.bind_addr,
-            auth: config.auth,
+            auth: config.auth.map(Arc::new),
             tls_acceptor,
         };
         Ok(server)
     }
 }
 
-enum Socks5Addr {
+enum Socks5Addr<'a> {
     Ip(IpAddr),
-    DomainName(String),
-}
-
-#[async_trait]
-trait MsgWrite: AsyncWrite + Unpin {
-    async fn write_msg<MSG: Encode + Send>(&mut self, msg: MSG) -> Result<(), Box<dyn Error>> {
-        let mut buff = [0u8; 1024];
-        let out = msg.encode(&mut buff)?;
-        self.write_all(out).await?;
-        Ok(())
-    }
-}
-
-impl MsgWrite for TcpStream {}
-
-impl MsgWrite for TlsStream<TcpStream> {}
-
-#[async_trait]
-trait Decode {
-    type Output;
-    async fn decode<R: AsyncRead + Unpin + Send>(rx: &mut R) -> Result<Self::Output, Box<dyn Error>>;
+    DomainName(Cow<'a, str>),
 }
 
 trait Encode {
-    fn encode(self, buff: &mut [u8]) -> Result<&[u8], Box<dyn Error>>;
+    fn encode(self, buff: &mut [u8]) -> io::Result<&[u8]>;
 }
 
 #[allow(dead_code)]
-struct NegotiateRequest {
+struct NegotiateRequest<'a> {
     version: u8,
     nmethods: u8,
-    methods: Vec<u8>,
+    methods: &'a [u8],
 }
 
 struct NegotiateResponse {
@@ -110,19 +104,19 @@ struct NegotiateResponse {
     methods: u8,
 }
 
-#[async_trait]
-impl Decode for NegotiateRequest {
-    type Output = NegotiateRequest;
+impl<'a> NegotiateRequest<'a> {
+    async fn decode<R: AsyncRead + Unpin>(
+        rx: &mut R,
+        buff: &'a mut [u8],
+    ) -> io::Result<NegotiateRequest<'a>> {
+        let mut temp_buff = [0u8; 2];
+        rx.read_exact(&mut temp_buff).await?;
 
-    async fn decode<R: AsyncRead + Unpin + Send>(rx: &mut R) -> Result<NegotiateRequest, Box<dyn Error>> {
-        let mut buff = [0u8; 2];
-        rx.read_exact(&mut buff).await?;
+        let version = temp_buff[0];
+        let nmethods = temp_buff[1];
 
-        let version = buff[0];
-        let nmethods = buff[1];
-
-        let mut methods = vec![0u8; nmethods as usize];
-        rx.read_exact(&mut methods).await?;
+        let methods = get_mut!(buff, ..nmethods as usize);
+        rx.read_exact(methods).await?;
 
         Ok(NegotiateRequest {
             version,
@@ -133,63 +127,20 @@ impl Decode for NegotiateRequest {
 }
 
 impl Encode for NegotiateResponse {
-    fn encode(self, buff: &mut [u8]) -> Result<&[u8], Box<dyn Error>> {
+    fn encode(self, buff: &mut [u8]) -> io::Result<&[u8]> {
         buff[0] = self.version;
         buff[1] = self.methods;
         Ok(&buff[..2])
     }
 }
 
-async fn negotiate<RW: AsyncRead + MsgWrite + Send>(stream: &mut RW, is_auth: bool) -> Result<(), Box<dyn Error>> {
-    let no_auth = 0x00;
-    let auth = 0x02;
-    let no_acceptable_methods = 0xff;
-
-    let negotiate_req = NegotiateRequest::decode(stream).await?;
-
-    if negotiate_req.version != SOCKS5_VERSION {
-        return Err(Box::new(io::Error::new(ErrorKind::InvalidData, "Invalid protocol version")));
-    };
-
-    let op = if is_auth {
-        match negotiate_req.methods.contains(&auth) {
-            true => Some(auth),
-            false => None
-        }
-    } else {
-        match negotiate_req.methods.contains(&no_auth) {
-            true => Some(no_auth),
-            false => None
-        }
-    };
-
-    match op {
-        Some(code) => {
-            let msg = NegotiateResponse {
-                version: SOCKS5_VERSION,
-                methods: code,
-            };
-            stream.write_msg(msg).await
-        }
-        None => {
-            let msg = NegotiateResponse {
-                version: SOCKS5_VERSION,
-                methods: no_acceptable_methods,
-            };
-
-            stream.write_msg(msg).await?;
-            Err(Box::new(io::Error::new(ErrorKind::Other, "No acceptable methods")))
-        }
-    }
-}
-
 #[allow(dead_code)]
-struct AuthRequest {
+struct AuthRequest<'a> {
     version: u8,
     username_len: u8,
-    username: String,
+    username: Cow<'a, str>,
     password_len: u8,
-    password: String,
+    password: Cow<'a, str>,
 }
 
 struct AuthResponse {
@@ -197,106 +148,72 @@ struct AuthResponse {
     status: u8,
 }
 
-#[async_trait]
-impl Decode for AuthRequest {
-    type Output = AuthRequest;
+impl<'a> AuthRequest<'a> {
+    async fn decode<R: AsyncRead + Unpin>(
+        rx: &mut R,
+        buff: &'a mut [u8],
+    ) -> io::Result<AuthRequest<'a>> {
+        let mut temp_buff = [0u8; 2];
+        rx.read_exact(&mut temp_buff).await?;
 
-    async fn decode<R: AsyncRead + Unpin + Send>(rx: &mut R) -> Result<AuthRequest, Box<dyn Error>> {
-        let mut buff = [0u8; 2];
-        rx.read_exact(&mut buff).await?;
+        let version = temp_buff[0];
+        let username_len = temp_buff[1];
 
-        let version = buff[0];
-        let username_len = buff[1];
-
-        let mut username_buff = vec![0u8; username_len as usize];
-        rx.read_exact(&mut username_buff).await?;
-        let username = String::from_utf8(username_buff)?;
+        let username_range = ..username_len as usize;
+        let username_buff = get_mut!(buff, username_range, "Username too long");
+        rx.read_exact(username_buff).await?;
 
         let password_len = rx.read_u8().await?;
-        let mut password_buff = vec![0u8; password_len as usize];
-        rx.read_exact(&mut password_buff).await?;
-        let password = String::from_utf8(password_buff)?;
+        let password_range = username_len as usize..(username_len + password_len) as usize;
+        let password_buff = get_mut!(&mut *buff, password_range.clone(), "Password too long");
+        rx.read_exact(password_buff).await?;
 
-        Ok(AuthRequest {
+        let username = String::from_utf8_lossy(&buff[username_range]);
+        let password = String::from_utf8_lossy(&buff[password_range]);
+
+        let auth_request = AuthRequest {
             version,
             username_len,
             username,
             password_len,
             password,
-        })
+        };
+        Ok(auth_request)
     }
 }
 
 impl Encode for AuthResponse {
-    fn encode(self, buff: &mut [u8]) -> Result<&[u8], Box<dyn Error>> {
+    fn encode(self, buff: &mut [u8]) -> io::Result<&[u8]> {
         buff[0] = self.version;
         buff[1] = self.status;
         Ok(&buff[..2])
     }
 }
 
-async fn auth<RW: AsyncRead + MsgWrite + Send>(
-    stream: &mut RW,
-    username: &str,
-    password: &str,
-) -> Result<(), Box<dyn Error>> {
-    let version = 0x01;
-    let success = 0x00;
-    let failed = 0x01;
-
-    let auth_request = AuthRequest::decode(stream).await?;
-
-    if auth_request.version == version {
-        if auth_request.username == username && auth_request.password == password {
-            let msg = AuthResponse {
-                version,
-                status: success,
-            };
-            stream.write_msg(msg).await
-        } else {
-            let msg = AuthResponse {
-                version,
-                status: failed,
-            };
-
-            stream.write_msg(msg).await?;
-            Err(Box::new(io::Error::new(ErrorKind::Other, "Authentication failed")))
-        }
-    } else {
-        let msg = AuthResponse {
-            version,
-            status: failed,
-        };
-
-        stream.write_msg(msg).await?;
-        Err(Box::new(io::Error::new(ErrorKind::Other, "Authentication version invalid")))
-    }
-}
-
 #[allow(dead_code)]
-struct AcceptRequest {
+struct AcceptRequest<'a> {
     version: u8,
     cmd: u8,
     rsv: u8,
     addr_type: u8,
-    dest_addr: Socks5Addr,
+    dest_addr: Socks5Addr<'a>,
     port: u16,
 }
 
-struct AcceptResponse {
+struct AcceptResponse<'a> {
     version: u8,
     rep: u8,
     rsv: u8,
     bind_addr_type: u8,
-    bind_addr: Socks5Addr,
+    bind_addr: Socks5Addr<'a>,
     bind_port: u16,
 }
 
-#[async_trait]
-impl Decode for AcceptRequest {
-    type Output = Option<AcceptRequest>;
-
-    async fn decode<R: AsyncRead + Unpin + Send>(rx: &mut R) -> Result<Option<AcceptRequest>, Box<dyn Error>> {
+impl<'a> AcceptRequest<'a> {
+    async fn decode<R: AsyncRead + Unpin>(
+        rx: &mut R,
+        buff: &'a mut [u8],
+    ) -> io::Result<AcceptRequest<'a>> {
         let mut request = [0u8; 4];
         rx.read_exact(&mut request).await?;
 
@@ -337,11 +254,11 @@ impl Decode for AcceptRequest {
             }
             DOMAIN_NAME => {
                 let len = rx.read_u8().await? as usize;
-                let mut buff = vec![0u8; len + 2];
+                let buff = get_mut!(buff, ..len + 2);
 
-                rx.read_exact(&mut buff).await?;
+                rx.read_exact(buff).await?;
 
-                let domain_name = String::from_utf8(buff[..len].to_vec())?;
+                let domain_name = String::from_utf8_lossy(&buff[..len]);
 
                 let mut port_buff = [0u8; 2];
                 port_buff.copy_from_slice(&buff[len..]);
@@ -349,7 +266,12 @@ impl Decode for AcceptRequest {
 
                 (Socks5Addr::DomainName(domain_name), port)
             }
-            _ => return Ok(None)
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Address type unsupported",
+                ));
+            }
         };
 
         let req = AcceptRequest {
@@ -360,30 +282,28 @@ impl Decode for AcceptRequest {
             dest_addr,
             port,
         };
-        Ok(Some(req))
+        Ok(req)
     }
 }
 
-impl Encode for AcceptResponse {
-    fn encode(self, buff: &mut [u8]) -> Result<&[u8], Box<dyn Error>> {
+impl Encode for AcceptResponse<'_> {
+    fn encode(self, buff: &mut [u8]) -> io::Result<&[u8]> {
         buff[0] = self.version;
         buff[1] = self.rep;
         buff[2] = self.rsv;
         buff[3] = self.bind_addr_type;
 
         let start = match self.bind_addr {
-            Socks5Addr::Ip(ip) => {
-                match ip {
-                    IpAddr::V4(v4) => {
-                        buff[4..8].copy_from_slice(&v4.octets());
-                        8
-                    }
-                    IpAddr::V6(v6) => {
-                        buff[4..20].copy_from_slice(&v6.octets());
-                        20
-                    }
+            Socks5Addr::Ip(ip) => match ip {
+                IpAddr::V4(v4) => {
+                    buff[4..8].copy_from_slice(&v4.octets());
+                    8
                 }
-            }
+                IpAddr::V6(v6) => {
+                    buff[4..20].copy_from_slice(&v6.octets());
+                    20
+                }
+            },
             Socks5Addr::DomainName(domain_name) => {
                 let domain_name_bytes = domain_name.as_bytes();
                 let domain_name_len = domain_name_bytes.len();
@@ -401,99 +321,22 @@ impl Encode for AcceptResponse {
     }
 }
 
-async fn accept<RW: AsyncRead + MsgWrite + Send>(stream: &mut RW, peer_addr: SocketAddr) -> Result<(), Box<dyn Error>> {
-    let op = AcceptRequest::decode(stream).await?;
-
-    let request = match op {
-        Some(accept_request) => accept_request,
-        None => {
-            let address_type_not_supported = 0x08;
-            let resp = build_err_resp(address_type_not_supported);
-            stream.write_msg(resp).await?;
-            return Err(Box::new(io::Error::new(ErrorKind::AddrNotAvailable, "Address type not supported")));
-        }
-    };
-
-    if request.version != SOCKS5_VERSION {
-        return Err(Box::new(io::Error::new(ErrorKind::Other, "Invalid protocol version")));
-    }
-
-    match request.cmd {
-        // TCP
-        0x01 => tcp_handle(stream, request).await?,
-        // UDP
-        0x03 => udp_handle(stream, peer_addr).await?,
-        _ => {
-            let cmd_not_supported = 0x07;
-            let resp = build_err_resp(cmd_not_supported);
-            stream.write_msg(resp).await?;
-            return Err(Box::new(io::Error::new(ErrorKind::Other, "Cmd not supported")));
-        }
-    };
-    Ok(())
-}
-
-async fn tcp_handle<RW: AsyncRead + MsgWrite + Send>(stream: &mut RW, request: AcceptRequest) -> Result<(), Box<dyn Error>> {
-    let res = match request.dest_addr {
-        Socks5Addr::Ip(ip) => TcpStream::connect((ip, request.port)).await,
-        Socks5Addr::DomainName(domain_name) => TcpStream::connect((domain_name, request.port)).await
-    };
-
-    let mut dest_stream = match res {
-        Ok(dest_stream) => dest_stream,
-        Err(err) => {
-            let err_code = match err.kind() {
-                ErrorKind::NotFound | ErrorKind::NotConnected => 0x03,
-                ErrorKind::PermissionDenied => 0x02,
-                ErrorKind::ConnectionRefused => 0x05,
-                ErrorKind::ConnectionAborted |
-                ErrorKind::ConnectionReset |
-                ErrorKind::TimedOut => 0x04,
-                ErrorKind::AddrNotAvailable => 0x08,
-                _ => 0x01,
-            };
-
-            let resp = build_err_resp(err_code);
-            stream.write_msg(resp).await?;
-            return Err(Box::new(err));
-        }
-    };
-
-    dest_stream.set_keepalive()?;
-
-    let success = 0x00;
-    let local_addr = dest_stream.local_addr()?;
-
-    let addr_type = match local_addr {
-        SocketAddr::V4(_) => IPV4,
-        SocketAddr::V6(_) => IPV6
-    };
-
-    let resp_msg = AcceptResponse {
-        version: SOCKS5_VERSION,
-        rep: success,
-        rsv: 0x00,
-        bind_addr_type: addr_type,
-        bind_addr: Socks5Addr::Ip(local_addr.ip()),
-        bind_port: local_addr.port(),
-    };
-
-    stream.write_msg(resp_msg).await?;
-    tokio::io::copy_bidirectional(stream, &mut dest_stream).await?;
-    Ok(())
+enum Cmd {
+    TCP(TcpStream),
+    UDP(UdpSocket),
 }
 
 struct UdpProxyPacket<'a> {
     rsv: u16,
     frag: u8,
     addr_type: u8,
-    dest_addr: Socks5Addr,
+    dest_addr: Socks5Addr<'a>,
     dest_port: u16,
     data: &'a [u8],
 }
 
 impl UdpProxyPacket<'_> {
-    fn decode(packet: &[u8]) -> Result<UdpProxyPacket, Box<dyn Error>> {
+    fn decode(packet: &[u8]) -> io::Result<UdpProxyPacket> {
         let frag = packet[2];
         let addr_type = packet[3];
 
@@ -512,14 +355,17 @@ impl UdpProxyPacket<'_> {
             }
             DOMAIN_NAME => {
                 let domain_name_len = packet[4] as usize;
-                let mut domain_name_buff = vec![0u8; domain_name_len];
                 let domain_end = 5 + domain_name_len;
-                domain_name_buff.copy_from_slice(&packet[5..domain_end]);
-                let domain_name = String::from_utf8(domain_name_buff)?;
+                let domain_name = String::from_utf8_lossy(&packet[5..domain_end]);
 
                 (Socks5Addr::DomainName(domain_name), domain_end)
             }
-            _ => return Err(Box::new(io::Error::new(ErrorKind::AddrNotAvailable, "Address type not supported")))
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Address type unsupported",
+                ));
+            }
         };
 
         let mut port_buff = [0u8; 2];
@@ -544,18 +390,16 @@ impl UdpProxyPacket<'_> {
         buff[3] = self.addr_type;
 
         let start = match self.dest_addr {
-            Socks5Addr::Ip(ip) => {
-                match ip {
-                    IpAddr::V4(v4) => {
-                        buff[4..8].copy_from_slice(&v4.octets());
-                        8
-                    }
-                    IpAddr::V6(v6) => {
-                        buff[4..20].copy_from_slice(&v6.octets());
-                        20
-                    }
+            Socks5Addr::Ip(ip) => match ip {
+                IpAddr::V4(v4) => {
+                    buff[4..8].copy_from_slice(&v4.octets());
+                    8
                 }
-            }
+                IpAddr::V6(v6) => {
+                    buff[4..20].copy_from_slice(&v6.octets());
+                    20
+                }
+            },
             Socks5Addr::DomainName(domain_name) => {
                 let domain_name_bytes = domain_name.as_bytes();
                 let domain_name_len = domain_name_bytes.len();
@@ -570,88 +414,29 @@ impl UdpProxyPacket<'_> {
 
         buff[start..(start + 2)].copy_from_slice(&self.dest_port.to_be_bytes());
         let end = start + 2 + self.data.len();
-        buff[(start + 2)..end].copy_from_slice(self.data);
-
         &buff[..end]
     }
 }
 
-async fn udp_handle<RW: AsyncRead + MsgWrite + Send>(stream: &mut RW, peer_addr: SocketAddr) -> Result<(), Box<dyn Error>> {
-    let udp_socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await?;
-
-    let local_addr = udp_socket.local_addr()?;
-    let local_to_peer_ip = get_interface_addr(peer_addr).await?;
-    let success = 0x00;
-
-    let addr_type = match local_to_peer_ip {
-        IpAddr::V4(_) => IPV4,
-        IpAddr::V6(_) => IPV6
-    };
-
-    let resp = AcceptResponse {
-        version: SOCKS5_VERSION,
-        rep: success,
-        rsv: 0x00,
-        bind_addr_type: addr_type,
-        bind_addr: Socks5Addr::Ip(local_to_peer_ip),
-        bind_port: local_addr.port(),
-    };
-
-    stream.write_msg(resp).await?;
-
-    let f1 = async move {
-        let _ = stream.read(&mut [0u8; 1]).await;
-        Ok(())
-    };
-
-    let f2 = async move {
-        let mut buff = vec![0u8; 65536];
-        let mut out = vec![0u8; 65536];
-
-        let (len, source_addr) = udp_socket.recv_from(&mut buff).await?;
-        proxy_server_to_dest(&buff[..len], &udp_socket).await?;
-
-        while let Ok((len, peer_addr)) = udp_socket.recv_from(&mut buff).await {
-            if peer_addr == source_addr {
-                proxy_server_to_dest(&buff[..len], &udp_socket).await?;
-            } else {
-                let addr_type = match peer_addr.ip() {
-                    IpAddr::V4(_) => IPV4,
-                    IpAddr::V6(_) => IPV6
-                };
-
-                let msg = UdpProxyPacket {
-                    rsv: 0x0000,
-                    frag: 0x00,
-                    addr_type,
-                    dest_addr: Socks5Addr::Ip(peer_addr.ip()),
-                    dest_port: peer_addr.port(),
-                    data: &buff[..len],
-                }.encode(&mut out);
-
-                udp_socket.send_to(msg, source_addr).await?;
-            }
-        }
-        Ok(())
-    };
-
-    tokio::select! {
-        res = f1 => res,
-        res = f2 => res
-    }
-}
-
-async fn proxy_server_to_dest(packet: &[u8], udp_socket: &UdpSocket) -> Result<(), Box<dyn Error>> {
+async fn proxy_server_to_dest(packet: &[u8], udp_socket: &UdpSocket) -> io::Result<()> {
     let packet = UdpProxyPacket::decode(packet)?;
 
     match packet.dest_addr {
-        Socks5Addr::Ip(ip) => udp_socket.send_to(packet.data, (ip, packet.dest_port)).await,
-        Socks5Addr::DomainName(domain_name) => udp_socket.send_to(packet.data, (domain_name, packet.dest_port)).await
+        Socks5Addr::Ip(ip) => {
+            udp_socket
+                .send_to(packet.data, (ip, packet.dest_port))
+                .await
+        }
+        Socks5Addr::DomainName(domain_name) => {
+            udp_socket
+                .send_to(packet.data, (&*domain_name, packet.dest_port))
+                .await
+        }
     }?;
     Ok(())
 }
 
-fn build_err_resp(rep: u8) -> AcceptResponse {
+fn build_err_resp(rep: u8) -> AcceptResponse<'static> {
     AcceptResponse {
         version: SOCKS5_VERSION,
         rep,
@@ -663,31 +448,301 @@ fn build_err_resp(rep: u8) -> AcceptResponse {
 }
 
 async fn get_interface_addr(dest_addr: SocketAddr) -> io::Result<IpAddr> {
-    static SOCKET: Lazy<Mutex<std::net::UdpSocket>> = Lazy::new(|| Mutex::new(std::net::UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).unwrap()));
-    let guard = SOCKET.lock();
-    guard.connect(dest_addr)?;
-    let addr = guard.local_addr()?;
-    Ok(addr.ip())
+    let bind_addr = match dest_addr {
+        SocketAddr::V4(_) => IpAddr::from(Ipv4Addr::UNSPECIFIED),
+        SocketAddr::V6(_) => IpAddr::from(Ipv6Addr::UNSPECIFIED),
+    };
+
+    let socket = UdpSocket::bind((bind_addr, 0)).await?;
+    socket.connect(dest_addr).await?;
+    Ok(socket.local_addr()?.ip())
 }
 
-async fn socks5_codec<RW: AsyncRead + MsgWrite + Send>(
-    stream: &mut RW,
+struct Socks5Handler<'a, RW> {
+    buff: Box<[u8]>,
+    stream: &'a mut RW,
     peer_addr: SocketAddr,
-    auth_op: Option<Auth>,
-) -> Result<(), Box<dyn Error>> {
-    negotiate(stream, auth_op.is_some()).await?;
+    auth: Option<Arc<Auth>>,
+}
 
-    if let Some(auth_param) = auth_op {
-        auth(stream, &auth_param.username, &auth_param.password).await?;
-    };
-    accept(stream, peer_addr).await
+impl<'a, RW: AsyncRead + AsyncWrite + Unpin> Socks5Handler<'a, RW> {
+    fn new(stream: &'a mut RW, peer_addr: SocketAddr, auth: Option<Arc<Auth>>) -> Self {
+        Socks5Handler {
+            buff: vec![0u8; 8192].into_boxed_slice(),
+            stream,
+            peer_addr,
+            auth,
+        }
+    }
+
+    async fn write_msg<MSG: Encode>(&mut self, msg: MSG) -> io::Result<()> {
+        let writer = &mut *self.stream;
+        let buff = &mut *self.buff;
+
+        let out = msg.encode(buff)?;
+        writer.write_all(out).await
+    }
+
+    async fn negotiate(&mut self, is_auth: bool) -> io::Result<()> {
+        const NO_AUTH: u8 = 0x00;
+        const AUTH: u8 = 0x02;
+        const NO_ACCEPTABLE_METHODS: u8 = 0xff;
+
+        let stream = &mut *self.stream;
+        let buff = &mut *self.buff;
+
+        let negotiate_req = NegotiateRequest::decode(stream, buff).await?;
+
+        if negotiate_req.version != SOCKS5_VERSION {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "Invalid protocol version",
+            ));
+        };
+
+        let op = if is_auth {
+            match negotiate_req.methods.contains(&AUTH) {
+                true => Some(AUTH),
+                false => None,
+            }
+        } else {
+            Some(NO_AUTH)
+        };
+
+        let msg = match op {
+            Some(code) => NegotiateResponse {
+                version: SOCKS5_VERSION,
+                methods: code,
+            },
+            None => NegotiateResponse {
+                version: SOCKS5_VERSION,
+                methods: NO_ACCEPTABLE_METHODS,
+            },
+        };
+        self.write_msg(msg).await
+    }
+
+    async fn auth(&mut self) -> io::Result<()> {
+        const VERSION: u8 = 0x01;
+        const SUCCESS: u8 = 0x00;
+        const FAILED: u8 = 0x01;
+
+        let (username, password) = match self.auth {
+            Some(ref auth) => (auth.username.as_str(), auth.password.as_str()),
+            None => return Ok(()),
+        };
+
+        let stream = &mut *self.stream;
+        let buff = &mut *self.buff;
+
+        let auth_request = AuthRequest::decode(stream, buff).await?;
+
+        let resp = if auth_request.version == VERSION {
+            if auth_request.username == username && auth_request.password == password {
+                AuthResponse {
+                    version: VERSION,
+                    status: SUCCESS,
+                }
+            } else {
+                AuthResponse {
+                    version: VERSION,
+                    status: FAILED,
+                }
+            }
+        } else {
+            AuthResponse {
+                version: VERSION,
+                status: FAILED,
+            }
+        };
+
+        self.write_msg(resp).await
+    }
+
+    async fn accept(&mut self) -> io::Result<Cmd> {
+        let stream = &mut *self.stream;
+
+        let request = match AcceptRequest::decode(stream, &mut *self.buff).await {
+            Ok(req) => req,
+            Err(e) => {
+                if e.kind() == io::ErrorKind::Unsupported {
+                    const ADDRESS_TYPE_UNSUPPORTED: u8 = 0x08;
+                    let resp = build_err_resp(ADDRESS_TYPE_UNSUPPORTED);
+                    self.write_msg(resp).await?;
+                }
+                return Err(e);
+            }
+        };
+
+        if request.version != SOCKS5_VERSION {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "Invalid protocol version",
+            ));
+        }
+
+        const TCP: u8 = 0x01;
+        const UDP: u8 = 0x03;
+
+        match request.cmd {
+            TCP => {
+                let dst_addr = match request.dest_addr {
+                    Socks5Addr::Ip(ip) => SocketAddr::from((ip, request.port)),
+                    Socks5Addr::DomainName(domain) => lookup_host((&*domain, request.port))
+                        .await?
+                        .next()
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::Other, "Resolve dst domain name error")
+                        })?,
+                };
+
+                let res = TcpStream::connect(dst_addr).await;
+
+                let dest_stream = match res {
+                    Ok(dest_stream) => dest_stream,
+                    Err(err) => {
+                        let err_code = match err.kind() {
+                            ErrorKind::NotFound | ErrorKind::NotConnected => 0x03,
+                            ErrorKind::PermissionDenied => 0x02,
+                            ErrorKind::ConnectionRefused => 0x05,
+                            ErrorKind::ConnectionAborted
+                            | ErrorKind::ConnectionReset
+                            | ErrorKind::TimedOut => 0x04,
+                            ErrorKind::AddrNotAvailable => 0x08,
+                            _ => 0x01,
+                        };
+
+                        let resp = build_err_resp(err_code);
+                        self.write_msg(resp).await?;
+                        return Err(err);
+                    }
+                };
+
+                dest_stream.set_keepalive()?;
+
+                const SUCCESS: u8 = 0x00;
+                let local_addr = dest_stream.local_addr()?;
+
+                let addr_type = match local_addr {
+                    SocketAddr::V4(_) => IPV4,
+                    SocketAddr::V6(_) => IPV6,
+                };
+
+                let resp_msg = AcceptResponse {
+                    version: SOCKS5_VERSION,
+                    rep: SUCCESS,
+                    rsv: 0x00,
+                    bind_addr_type: addr_type,
+                    bind_addr: Socks5Addr::Ip(local_addr.ip()),
+                    bind_port: local_addr.port(),
+                };
+
+                self.write_msg(resp_msg).await?;
+                Ok(Cmd::TCP(dest_stream))
+            }
+            UDP => {
+                let bind_addr = match self.peer_addr {
+                    SocketAddr::V4(_) => IpAddr::from(Ipv4Addr::UNSPECIFIED),
+                    SocketAddr::V6(_) => IpAddr::from(Ipv6Addr::UNSPECIFIED),
+                };
+                let udp_socket = UdpSocket::bind((bind_addr, 0)).await?;
+
+                let local_addr = udp_socket.local_addr()?;
+                let local_to_peer_ip = get_interface_addr(self.peer_addr).await?;
+                let success = 0x00;
+
+                let addr_type = match local_to_peer_ip {
+                    IpAddr::V4(_) => IPV4,
+                    IpAddr::V6(_) => IPV6,
+                };
+
+                let resp = AcceptResponse {
+                    version: SOCKS5_VERSION,
+                    rep: success,
+                    rsv: 0x00,
+                    bind_addr_type: addr_type,
+                    bind_addr: Socks5Addr::Ip(local_to_peer_ip),
+                    bind_port: local_addr.port(),
+                };
+
+                self.write_msg(resp).await?;
+                Ok(Cmd::UDP(udp_socket))
+            }
+            _ => {
+                const CMD_UNSUPPORTED: u8 = 0x07;
+                let resp = build_err_resp(CMD_UNSUPPORTED);
+                self.write_msg(resp).await?;
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "CMD unsupported",
+                ))
+            }
+        }
+    }
+
+    async fn udp_tunnel(&mut self, udp_socket: UdpSocket) -> io::Result<()> {
+        let stream = &mut *self.stream;
+        let mut buff = PointerWrap::new(&mut *self.buff);
+
+        let f1 = async move {
+            let _ = stream.read_u8().await;
+            Ok(())
+        };
+
+        let f2 = async move {
+            let (len, source_addr) = udp_socket.recv_from(&mut *buff).await?;
+            proxy_server_to_dest(&buff[..len], &udp_socket).await?;
+
+            while let Ok((len, peer_addr)) = udp_socket.recv_from(&mut *buff).await {
+                if peer_addr == source_addr {
+                    proxy_server_to_dest(&buff[..len], &udp_socket).await?;
+                } else {
+                    let addr_type = match peer_addr.ip() {
+                        IpAddr::V4(_) => IPV4,
+                        IpAddr::V6(_) => IPV6,
+                    };
+
+                    let msg = UdpProxyPacket {
+                        rsv: 0x0000,
+                        frag: 0x00,
+                        addr_type,
+                        dest_addr: Socks5Addr::Ip(peer_addr.ip()),
+                        dest_port: peer_addr.port(),
+                        data: &buff.clone()[..len],
+                    }
+                        .encode(&mut *buff);
+
+                    udp_socket.send_to(msg, source_addr).await?;
+                }
+            }
+            Ok(())
+        };
+
+        tokio::select! {
+            res = f1 => res,
+            res = f2 => res
+        }
+    }
+
+    async fn exec(mut self) -> io::Result<()> {
+        self.negotiate(self.auth.is_some()).await?;
+        self.auth().await?;
+
+        match self.accept().await? {
+            Cmd::TCP(mut dst_stream) => {
+                tokio::io::copy_bidirectional(self.stream, &mut dst_stream).await?;
+                Ok(())
+            }
+            Cmd::UDP(socket) => self.udp_tunnel(socket).await,
+        }
+    }
 }
 
 async fn server_start(
     bind_addr: SocketAddr,
-    auth: Option<Auth>,
+    auth: Option<Arc<Auth>>,
     tls_acceptor: Option<TlsAcceptor>,
-) -> Result<(), Box<dyn Error>> {
+) -> io::Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
 
     while let Ok((mut stream, peer_addr)) = listener.accept().await {
@@ -701,11 +756,18 @@ async fn server_start(
                 match tls_acceptor_op {
                     Some(acceptor) => {
                         let mut tls_stream = acceptor.accept(stream).await?;
-                        socks5_codec(&mut tls_stream, peer_addr, auth).await
+                        Socks5Handler::new(&mut tls_stream, peer_addr, auth)
+                            .exec()
+                            .await
                     }
-                    None => socks5_codec(&mut stream, peer_addr, auth).await
+                    None => {
+                        Socks5Handler::new(&mut stream, peer_addr, auth)
+                            .exec()
+                            .await
+                    }
                 }
-            }.await;
+            }
+                .await;
 
             if let Err(e) = res {
                 error!("{} -> {}", peer_addr, e)
