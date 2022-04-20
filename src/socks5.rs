@@ -8,9 +8,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ErrorKind};
 use tokio::net::{lookup_host, TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::TlsAcceptor;
 
-use crate::{Auth, BoxFuture, ProxyConfig, ProxyServer};
-use crate::common::{PointerWrap, SocketExt};
 use crate::common::load_tls_config;
+use crate::common::{PointerWrap, SocketExt};
+use crate::{Auth, BoxFuture, ProxyConfig, ProxyServer};
 
 const SOCKS5_VERSION: u8 = 0x05;
 const IPV4: u8 = 0x01;
@@ -412,7 +412,7 @@ impl UdpProxyPacket<'_> {
             }
         };
 
-        buff[start..(start + 2)].copy_from_slice(&self.dest_port.to_be_bytes());
+        buff[start..start + 2].copy_from_slice(&self.dest_port.to_be_bytes());
         let end = start + 2 + self.data.len();
         &buff[..end]
     }
@@ -583,6 +583,7 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin> Socks5Handler<'a, RW> {
 
         const TCP: u8 = 0x01;
         const UDP: u8 = 0x03;
+        const SUCCESS: u8 = 0x00;
 
         match request.cmd {
             TCP => {
@@ -619,8 +620,6 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin> Socks5Handler<'a, RW> {
                 };
 
                 dest_stream.set_keepalive()?;
-
-                const SUCCESS: u8 = 0x00;
                 let local_addr = dest_stream.local_addr()?;
 
                 let addr_type = match local_addr {
@@ -649,7 +648,6 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin> Socks5Handler<'a, RW> {
 
                 let local_addr = udp_socket.local_addr()?;
                 let local_to_peer_ip = get_interface_addr(self.peer_addr).await?;
-                let success = 0x00;
 
                 let addr_type = match local_to_peer_ip {
                     IpAddr::V4(_) => IPV4,
@@ -658,7 +656,7 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin> Socks5Handler<'a, RW> {
 
                 let resp = AcceptResponse {
                     version: SOCKS5_VERSION,
-                    rep: success,
+                    rep: SUCCESS,
                     rsv: 0x00,
                     bind_addr_type: addr_type,
                     bind_addr: Socks5Addr::Ip(local_to_peer_ip),
@@ -693,9 +691,14 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin> Socks5Handler<'a, RW> {
             let (len, source_addr) = udp_socket.recv_from(&mut *buff).await?;
             proxy_server_to_dest(&buff[..len], &udp_socket).await?;
 
-            while let Ok((len, peer_addr)) = udp_socket.recv_from(&mut *buff).await {
+            let data_range_start =  match udp_socket.local_addr()?.ip() {
+                IpAddr::V4(_) => 10,
+                IpAddr::V6(_) => 22
+            };
+
+            while let Ok((len, peer_addr)) = udp_socket.recv_from(&mut buff[data_range_start..]).await {
                 if peer_addr == source_addr {
-                    proxy_server_to_dest(&buff[..len], &udp_socket).await?;
+                    proxy_server_to_dest(&buff[data_range_start..data_range_start + len], &udp_socket).await?;
                 } else {
                     let addr_type = match peer_addr.ip() {
                         IpAddr::V4(_) => IPV4,
@@ -708,9 +711,9 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin> Socks5Handler<'a, RW> {
                         addr_type,
                         dest_addr: Socks5Addr::Ip(peer_addr.ip()),
                         dest_port: peer_addr.port(),
-                        data: &buff.clone()[..len],
+                        data: &buff.clone()[data_range_start..data_range_start + len],
                     }
-                        .encode(&mut *buff);
+                    .encode(&mut *buff);
 
                     udp_socket.send_to(msg, source_addr).await?;
                 }
@@ -745,7 +748,8 @@ async fn server_start(
 ) -> io::Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
 
-    while let Ok((mut stream, peer_addr)) = listener.accept().await {
+    loop {
+        let (mut stream, peer_addr) = listener.accept().await?;
         let auth = auth.clone();
         let tls_acceptor_op = tls_acceptor.clone();
 
@@ -767,12 +771,11 @@ async fn server_start(
                     }
                 }
             }
-                .await;
+            .await;
 
             if let Err(e) = res {
                 error!("{} -> {}", peer_addr, e)
             }
         });
     }
-    Ok(())
 }

@@ -1,18 +1,18 @@
 #[macro_use]
 extern crate log;
 
-use std::{env, io};
 use std::error::Error;
 use std::future::Future;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::{env, io};
 
+use log::LevelFilter;
 use log4rs::append::console::ConsoleAppender;
 use log4rs::config::{Appender, Root};
-use log4rs::Config;
 use log4rs::encode::pattern::PatternEncoder;
-use log::LevelFilter;
+use log4rs::Config;
 use serde::Deserialize;
 use tokio::fs;
 
@@ -41,7 +41,7 @@ pub struct Auth {
     password: String,
 }
 
-type BoxFuture<V> = Pin<Box<dyn Future<Output=V> + Send>>;
+type BoxFuture<V> = Pin<Box<dyn Future<Output = V> + Send>>;
 
 pub trait ProxyServer {
     fn start(self: Box<Self>) -> BoxFuture<io::Result<()>>;
@@ -76,7 +76,7 @@ async fn process() -> io::Result<()> {
                 let proxy_server = match_server(config).await?;
                 proxy_server.start().await
             }
-                .await
+            .await
             {
                 error!("{} -> {}", bind_addr, e)
             }
@@ -105,7 +105,7 @@ async fn match_server(config: ProxyConfig) -> io::Result<Box<dyn ProxyServer + S
             return Err(io::Error::new(
                 ErrorKind::InvalidInput,
                 "Invalid proxy protocol",
-            ));
+            ))
         }
     };
     Ok(p)

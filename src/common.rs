@@ -4,8 +4,8 @@ use std::ops::{Deref, DerefMut};
 use socket2::TcpKeepalive;
 use tokio::fs;
 use tokio::time::Duration;
-use tokio_rustls::rustls::{Certificate, PrivateKey, RootCertStore, ServerConfig};
 use tokio_rustls::rustls::server::AllowAnyAuthenticatedClient;
+use tokio_rustls::rustls::{Certificate, PrivateKey, RootCertStore, ServerConfig};
 
 use crate::ServerCertKey;
 
@@ -51,7 +51,7 @@ pub async fn load_tls_config(
                 .pop()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid cert"))?,
         )
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
         builder.with_client_cert_verifier(AllowAnyAuthenticatedClient::new(root))
     } else {

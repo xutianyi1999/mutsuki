@@ -7,16 +7,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::TryFutureExt;
-use hyper::{Body, Client, http, Method, Request, Response, Server};
 use hyper::server::conn::AddrIncoming;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::upgrade::Upgraded;
+use hyper::{http, Body, Client, Method, Request, Response, Server};
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::ServerConfig;
 
-use crate::{Auth, BoxFuture, ProxyConfig, ProxyServer};
 use crate::common::{load_tls_config, SocketExt};
 use crate::http::tls::TlsAcceptor;
+use crate::{Auth, BoxFuture, ProxyConfig, ProxyServer};
 
 type HttpClient = Client<hyper::client::HttpConnector>;
 
@@ -150,7 +150,7 @@ async fn proxy(
                         tunnel(upgraded, addr).await?;
                         Ok(())
                     }
-                        .await;
+                    .await;
 
                     if let Err(e) = res {
                         error!("{}", e)
@@ -218,8 +218,8 @@ mod tls {
     use std::sync::Arc;
     use std::task::{Context, Poll};
 
-    use futures_util::Future;
     use futures_util::ready;
+    use futures_util::Future;
     use hyper::server::accept::Accept;
     use hyper::server::conn::{AddrIncoming, AddrStream};
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
