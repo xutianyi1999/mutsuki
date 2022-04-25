@@ -640,18 +640,29 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin> Socks5Handler<'a, RW> {
                 Ok(Cmd::TCP(dest_stream))
             }
             UDP => {
-                let bind_addr = match self.peer_addr {
-                    SocketAddr::V4(_) => IpAddr::from(Ipv4Addr::UNSPECIFIED),
-                    SocketAddr::V6(_) => IpAddr::from(Ipv6Addr::UNSPECIFIED),
+                let bind_addr = match request.dest_addr {
+                    Socks5Addr::Ip(ip) => SocketAddr::from((ip, request.port)),
+                    Socks5Addr::DomainName(domain) => lookup_host((&*domain, request.port))
+                        .await?
+                        .next()
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::Other, "Resolve dst domain name error")
+                        })?,
                 };
-                let udp_socket = UdpSocket::bind((bind_addr, 0)).await?;
 
+                let udp_socket = UdpSocket::bind(bind_addr).await?;
                 let local_addr = udp_socket.local_addr()?;
-                let local_to_peer_ip = get_interface_addr(self.peer_addr).await?;
 
-                let addr_type = match local_to_peer_ip {
-                    IpAddr::V4(_) => IPV4,
-                    IpAddr::V6(_) => IPV6,
+                let local_addr = if local_addr.ip().is_unspecified() {
+                    let local_to_peer_ip = get_interface_addr(self.peer_addr).await?;
+                    SocketAddr::new(local_to_peer_ip, local_addr.port())
+                } else {
+                    local_addr
+                };
+
+                let addr_type = match local_addr {
+                    SocketAddr::V4(_) => IPV4,
+                    SocketAddr::V6(_) => IPV6,
                 };
 
                 let resp = AcceptResponse {
@@ -659,7 +670,7 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin> Socks5Handler<'a, RW> {
                     rep: SUCCESS,
                     rsv: 0x00,
                     bind_addr_type: addr_type,
-                    bind_addr: Socks5Addr::Ip(local_to_peer_ip),
+                    bind_addr: Socks5Addr::Ip(local_addr.ip()),
                     bind_port: local_addr.port(),
                 };
 
