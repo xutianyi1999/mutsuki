@@ -654,6 +654,7 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin> Socks5Handler<'a, RW> {
                 let local_addr = udp_socket.local_addr()?;
 
                 let local_addr = if local_addr.ip().is_unspecified() {
+                    // TODO maybe bind ipv4 ipv6 address type not match
                     let local_to_peer_ip = get_interface_addr(self.peer_addr).await?;
                     SocketAddr::new(local_to_peer_ip, local_addr.port())
                 } else {

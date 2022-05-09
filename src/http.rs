@@ -32,6 +32,7 @@ impl ProxyServer for HttpProxyServer {
             .http1_preserve_header_case(true)
             .build_http();
 
+        let client  = Arc::new(client);
         let bind_addr = self.bind_addr;
         let auth = self.auth;
 
@@ -80,6 +81,7 @@ impl ProxyServer for HttpsProxyServer {
             .http1_preserve_header_case(true)
             .build_http();
 
+        let client  = Arc::new(client);
         let bind_addr = self.bind_addr;
         let auth = self.auth;
         let tls_config = self.tls_config;
@@ -131,7 +133,7 @@ impl HttpsProxyServer {
 }
 
 async fn proxy(
-    client: HttpClient,
+    client: Arc<HttpClient>,
     req: Request<Body>,
     auth_opt: Option<Arc<Auth>>,
 ) -> io::Result<Response<Body>> {
