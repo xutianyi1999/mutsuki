@@ -1,6 +1,7 @@
 use std::io;
 use std::ops::{Deref, DerefMut};
 
+use rustls_pemfile::Item;
 use socket2::TcpKeepalive;
 use tokio::fs;
 use tokio::time::Duration;
@@ -43,15 +44,13 @@ pub async fn load_tls_config(
     let builder = ServerConfig::builder().with_safe_defaults();
 
     let builder = if let Some(cert_path) = client_cert_path {
-        let mut client_cert = load_certs(&cert_path).await?;
-
+        let client_certs = load_certs(&cert_path).await?;
         let mut root = RootCertStore::empty();
-        root.add(
-            &client_cert
-                .pop()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid cert"))?,
-        )
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+        for client_cert in client_certs {
+            root.add(&client_cert)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        }
 
         builder.with_client_cert_verifier(AllowAnyAuthenticatedClient::new(root))
     } else {
@@ -75,11 +74,19 @@ async fn load_certs(path: &str) -> io::Result<Vec<Certificate>> {
 }
 
 async fn load_keys(path: &str) -> io::Result<Vec<PrivateKey>> {
+    let mut keys = Vec::new();
     let keys_buff = fs::read(path).await?;
     let mut buff: &[u8] = &keys_buff;
 
-    rustls_pemfile::pkcs8_private_keys(&mut buff)
-        .map(|keys| keys.into_iter().map(PrivateKey).collect())
+    loop {
+        match rustls_pemfile::read_one(&mut buff)? {
+            None => return Ok(keys),
+            Some(Item::ECKey(key)) => keys.push(PrivateKey(key)),
+            Some(Item::PKCS8Key(key)) => keys.push(PrivateKey(key)),
+            Some(Item::RSAKey(key)) => keys.push(PrivateKey(key)),
+            _ => ()
+        }
+    }
 }
 
 #[derive(Copy)]
