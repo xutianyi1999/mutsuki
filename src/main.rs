@@ -13,12 +13,16 @@ use log4rs::append::console::ConsoleAppender;
 use log4rs::config::{Appender, Root};
 use log4rs::encode::pattern::PatternEncoder;
 use log4rs::Config;
+use mimalloc::MiMalloc;
 use serde::Deserialize;
 use tokio::fs;
 
 mod common;
 mod http;
 mod socks5;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Deserialize, Clone)]
 pub struct ProxyConfig {
