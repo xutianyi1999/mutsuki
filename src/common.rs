@@ -1,5 +1,4 @@
 use std::io;
-use std::ops::{Deref, DerefMut};
 
 use rustls_pemfile::Item;
 use socket2::TcpKeepalive;
@@ -84,42 +83,7 @@ async fn load_keys(path: &str) -> io::Result<Vec<PrivateKey>> {
             Some(Item::ECKey(key)) => keys.push(PrivateKey(key)),
             Some(Item::PKCS8Key(key)) => keys.push(PrivateKey(key)),
             Some(Item::RSAKey(key)) => keys.push(PrivateKey(key)),
-            _ => ()
+            _ => (),
         }
     }
 }
-
-#[derive(Copy)]
-pub(crate) struct PointerWrap<T: ?Sized> {
-    ptr: *mut T,
-}
-
-impl<T: ?Sized> PointerWrap<T> {
-    pub fn new(ptr: &mut T) -> Self {
-        PointerWrap { ptr }
-    }
-}
-
-impl<T: ?Sized> Deref for PointerWrap<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { &*self.ptr }
-    }
-}
-
-impl<T: ?Sized> DerefMut for PointerWrap<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe { &mut *self.ptr }
-    }
-}
-
-impl<T: ?Sized> Clone for PointerWrap<T> {
-    fn clone(&self) -> Self {
-        PointerWrap { ptr: self.ptr }
-    }
-}
-
-unsafe impl<T: ?Sized> Send for PointerWrap<T> {}
-
-unsafe impl<T: ?Sized> Sync for PointerWrap<T> {}

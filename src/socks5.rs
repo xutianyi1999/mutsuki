@@ -8,8 +8,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ErrorKind};
 use tokio::net::{lookup_host, TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::TlsAcceptor;
 
-use crate::common::load_tls_config;
-use crate::common::{PointerWrap, SocketExt};
+use crate::common::{load_tls_config, SocketExt};
 use crate::{Auth, BoxFuture, ProxyConfig, ProxyServer};
 
 const SOCKS5_VERSION: u8 = 0x05;
@@ -89,7 +88,7 @@ enum Socks5Addr<'a> {
 }
 
 trait Encode {
-    fn encode(self, buff: &mut [u8]) -> io::Result<&[u8]>;
+    fn encode(self, buff: &mut [u8]) -> &[u8];
 }
 
 #[allow(dead_code)]
@@ -127,10 +126,10 @@ impl<'a> NegotiateRequest<'a> {
 }
 
 impl Encode for NegotiateResponse {
-    fn encode(self, buff: &mut [u8]) -> io::Result<&[u8]> {
+    fn encode(self, buff: &mut [u8]) -> &[u8] {
         buff[0] = self.version;
         buff[1] = self.methods;
-        Ok(&buff[..2])
+        &buff[..2]
     }
 }
 
@@ -183,10 +182,10 @@ impl<'a> AuthRequest<'a> {
 }
 
 impl Encode for AuthResponse {
-    fn encode(self, buff: &mut [u8]) -> io::Result<&[u8]> {
+    fn encode(self, buff: &mut [u8]) -> &[u8] {
         buff[0] = self.version;
         buff[1] = self.status;
-        Ok(&buff[..2])
+        &buff[..2]
     }
 }
 
@@ -287,7 +286,7 @@ impl<'a> AcceptRequest<'a> {
 }
 
 impl Encode for AcceptResponse<'_> {
-    fn encode(self, buff: &mut [u8]) -> io::Result<&[u8]> {
+    fn encode(self, buff: &mut [u8]) -> &[u8] {
         buff[0] = self.version;
         buff[1] = self.rep;
         buff[2] = self.rsv;
@@ -317,7 +316,7 @@ impl Encode for AcceptResponse<'_> {
         };
 
         buff[start..(start + 2)].copy_from_slice(&self.bind_port.to_be_bytes());
-        Ok(&buff[..(start + 2)])
+        &buff[..(start + 2)]
     }
 }
 
@@ -384,7 +383,7 @@ impl UdpProxyPacket<'_> {
         })
     }
 
-    fn encode(self, buff: &mut [u8]) -> &[u8] {
+    fn encode(self, buff: &mut [u8]) -> usize {
         buff[0..2].copy_from_slice(&self.rsv.to_be_bytes());
         buff[2] = self.frag;
         buff[3] = self.addr_type;
@@ -413,8 +412,7 @@ impl UdpProxyPacket<'_> {
         };
 
         buff[start..start + 2].copy_from_slice(&self.dest_port.to_be_bytes());
-        let end = start + 2 + self.data.len();
-        &buff[..end]
+        start + 2 + self.data.len()
     }
 }
 
@@ -479,7 +477,7 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin> Socks5Handler<'a, RW> {
         let writer = &mut *self.stream;
         let buff = &mut *self.buff;
 
-        let out = msg.encode(buff)?;
+        let out = msg.encode(buff);
         writer.write_all(out).await
     }
 
@@ -692,7 +690,7 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin> Socks5Handler<'a, RW> {
 
     async fn udp_tunnel(&mut self, udp_socket: UdpSocket) -> io::Result<()> {
         let stream = &mut *self.stream;
-        let mut buff = PointerWrap::new(&mut *self.buff);
+        let buff = &mut *self.buff;
 
         let f1 = async move {
             let _ = stream.read_u8().await;
@@ -711,29 +709,27 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin> Socks5Handler<'a, RW> {
             while let Ok((len, peer_addr)) =
                 udp_socket.recv_from(&mut buff[data_range_start..]).await
             {
+                let (left, right) = buff.split_at_mut(data_range_start);
+
                 if peer_addr == source_addr {
-                    proxy_server_to_dest(
-                        &buff[data_range_start..data_range_start + len],
-                        &udp_socket,
-                    )
-                    .await?;
+                    proxy_server_to_dest(&right[..len], &udp_socket).await?;
                 } else {
                     let addr_type = match peer_addr.ip() {
                         IpAddr::V4(_) => IPV4,
                         IpAddr::V6(_) => IPV6,
                     };
 
-                    let msg = UdpProxyPacket {
+                    let end = UdpProxyPacket {
                         rsv: 0x0000,
                         frag: 0x00,
                         addr_type,
                         dest_addr: Socks5Addr::Ip(peer_addr.ip()),
                         dest_port: peer_addr.port(),
-                        data: &buff.clone()[data_range_start..data_range_start + len],
+                        data: &right[..len],
                     }
-                    .encode(&mut *buff);
+                    .encode(left);
 
-                    udp_socket.send_to(msg, source_addr).await?;
+                    udp_socket.send_to(&buff[..end], source_addr).await?;
                 }
             }
             Ok(())
