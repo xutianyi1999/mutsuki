@@ -466,7 +466,7 @@ struct Socks5Handler<'a, RW> {
 impl<'a, RW: AsyncRead + AsyncWrite + Unpin> Socks5Handler<'a, RW> {
     fn new(stream: &'a mut RW, peer_addr: SocketAddr, auth: Option<Arc<Auth>>) -> Self {
         Socks5Handler {
-            buff: vec![0u8; 8192].into_boxed_slice(),
+            buff: vec![0u8; 1024].into_boxed_slice(),
             stream,
             peer_addr,
             auth,
