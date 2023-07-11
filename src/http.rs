@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 use std::option::Option::Some;
 use std::sync::Arc;
 use std::time::Duration;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 
 use futures_util::TryFutureExt;
 use hyper::server::conn::AddrIncoming;
@@ -198,7 +200,7 @@ fn auth(auth_opt: Option<&Auth>, req: &Request<Body>) -> Result<bool, Box<dyn Er
                         "Parse Proxy-Authorization failed",
                     )
                 })?;
-                let username_and_password = String::from_utf8(base64::decode(value)?)?;
+                let username_and_password = String::from_utf8( STANDARD.decode(value)?)?;
 
                 let mut res = username_and_password.split(':');
 

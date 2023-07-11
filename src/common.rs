@@ -1,4 +1,5 @@
 use std::io;
+use std::sync::Arc;
 
 use rustls_pemfile::Item;
 use socket2::TcpKeepalive;
@@ -51,7 +52,7 @@ pub async fn load_tls_config(
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         }
 
-        builder.with_client_cert_verifier(AllowAnyAuthenticatedClient::new(root))
+        builder.with_client_cert_verifier(Arc::new(AllowAnyAuthenticatedClient::new(root)))
     } else {
         builder.with_no_client_auth()
     };
