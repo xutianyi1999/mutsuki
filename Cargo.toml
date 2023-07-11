@@ -1,6 +1,6 @@
 [package]
 name = "mutsuki"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["xty <xutianyi1999@live.com>"]
 edition = "2021"
 
