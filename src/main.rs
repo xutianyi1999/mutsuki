@@ -2,17 +2,15 @@
 extern crate log;
 
 use std::error::Error;
-use std::future::Future;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::pin::Pin;
+use std::str::FromStr;
 use std::{env, io};
 
 use log::LevelFilter;
 use log4rs::append::console::ConsoleAppender;
 use log4rs::config::{Appender, Root};
 use log4rs::encode::pattern::PatternEncoder;
-use log4rs::Config;
 use mimalloc::MiMalloc;
 use serde::Deserialize;
 use tokio::fs;
@@ -45,12 +43,6 @@ pub struct Auth {
     password: String,
 }
 
-type BoxFuture<V> = Pin<Box<dyn Future<Output = V> + Send>>;
-
-pub trait ProxyServer {
-    fn start(self: Box<Self>) -> BoxFuture<io::Result<()>>;
-}
-
 #[tokio::main]
 async fn main() {
     logger_init().unwrap();
@@ -66,7 +58,7 @@ async fn process() -> io::Result<()> {
 
     let config_path = args
         .next()
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "Command invalid"))?;
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "invalid command"))?;
     let json = fs::read(config_path).await?;
     let config_list: Vec<ProxyConfig> = serde_json::from_slice(&json)?;
 
@@ -76,16 +68,9 @@ async fn process() -> io::Result<()> {
         let handle = tokio::spawn(async move {
             let bind_addr = config.bind_addr;
 
-            if let Err(e) = async move {
-                let proxy_server = match_server(config).await?;
-                proxy_server.start().await
+            if let Err(e) = match_server(config).await {
+                error!("server {} error: {}", bind_addr, e);
             }
-            .await
-            {
-                error!("{} -> {}", bind_addr, e)
-            }
-
-            error!("{} crashed", bind_addr);
         });
 
         join_list.push(handle)
@@ -93,38 +78,50 @@ async fn process() -> io::Result<()> {
 
     for h in join_list {
         if let Err(e) = h.await {
-            error!("{}", e)
+            error!("server error: {}", e)
         }
     }
     Ok(())
 }
 
-async fn match_server(config: ProxyConfig) -> io::Result<Box<dyn ProxyServer + Send>> {
-    let p: Box<dyn ProxyServer + Send> = match config.protocol.as_str() {
-        "socks5" => Box::new(socks5::Socks5ProxyServer::new(config)),
-        "socks5_over_tls" => Box::new(socks5::Socks5OverTlsProxyServer::new(config).await?),
-        "http" => Box::new(http::HttpProxyServer::new(config)),
-        "https" => Box::new(http::HttpsProxyServer::new(config).await?),
-        _ => {
-            return Err(io::Error::new(
-                ErrorKind::InvalidInput,
-                "Invalid proxy protocol",
-            ))
+async fn match_server(config: ProxyConfig) -> io::Result<()> {
+    match config.protocol.as_str() {
+        "socks5" => socks5::Socks5ProxyServer::new(config).start().await,
+        "socks5_over_tls" => {
+            socks5::Socks5OverTlsProxyServer::new(config)
+                .await?
+                .start()
+                .await
         }
-    };
-    Ok(p)
+        "http" => http::HttpProxyServer::new(config).start().await,
+        "https" => http::HttpsProxyServer::new(config).await?.start().await,
+        _ => Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "invalid proxy protocol",
+        )),
+    }
 }
 
 fn logger_init() -> Result<(), Box<dyn Error>> {
+    let pattern = if cfg!(debug_assertions) {
+        "[{d(%Y-%m-%d %H:%M:%S)}] {h({l})} {f}:{L} - {m}{n}"
+    } else {
+        "[{d(%Y-%m-%d %H:%M:%S)}] {h({l})} {t} - {m}{n}"
+    };
+
     let stdout = ConsoleAppender::builder()
-        .encoder(Box::new(PatternEncoder::new(
-            "[Console] {d(%Y-%m-%d %H:%M:%S)} - {l} - {m}{n}",
-        )))
+        .encoder(Box::new(PatternEncoder::new(pattern)))
         .build();
 
-    let config = Config::builder()
+    let config = log4rs::Config::builder()
         .appender(Appender::builder().build("stdout", Box::new(stdout)))
-        .build(Root::builder().appender("stdout").build(LevelFilter::Info))?;
+        .build(
+            Root::builder()
+                .appender("stdout")
+                .build(LevelFilter::from_str(
+                    std::env::var("MUTSUKI_LOG").as_deref().unwrap_or("INFO"),
+                )?),
+        )?;
 
     log4rs::init_config(config)?;
     Ok(())

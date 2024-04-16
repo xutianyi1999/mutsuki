@@ -9,7 +9,7 @@ use tokio::net::{lookup_host, TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::TlsAcceptor;
 
 use crate::common::{load_tls_config, SocketExt};
-use crate::{Auth, BoxFuture, ProxyConfig, ProxyServer};
+use crate::{Auth,  ProxyConfig};
 
 const SOCKS5_VERSION: u8 = 0x05;
 const IPV4: u8 = 0x01;
@@ -32,19 +32,17 @@ pub struct Socks5ProxyServer {
     auth: Option<Arc<Auth>>,
 }
 
-impl ProxyServer for Socks5ProxyServer {
-    fn start(self: Box<Self>) -> BoxFuture<io::Result<()>> {
-        info!("Listening on socks5://{}", self.bind_addr);
-        Box::pin(server_start(self.bind_addr, self.auth, None))
-    }
-}
-
 impl Socks5ProxyServer {
     pub fn new(config: ProxyConfig) -> Self {
         Socks5ProxyServer {
             bind_addr: config.bind_addr,
             auth: config.auth.map(Arc::new),
         }
+    }
+
+    pub async fn start(self) -> io::Result<()> {
+        info!("listening on socks5://{}", self.bind_addr);
+        server_start(self.bind_addr, self.auth, None).await
     }
 }
 
@@ -54,21 +52,10 @@ pub struct Socks5OverTlsProxyServer {
     tls_acceptor: TlsAcceptor,
 }
 
-impl ProxyServer for Socks5OverTlsProxyServer {
-    fn start(self: Box<Self>) -> BoxFuture<io::Result<()>> {
-        info!("Listening on socks5 over tls://{}", self.bind_addr);
-        Box::pin(server_start(
-            self.bind_addr,
-            self.auth,
-            Some(self.tls_acceptor),
-        ))
-    }
-}
-
 impl Socks5OverTlsProxyServer {
     pub async fn new(config: ProxyConfig) -> io::Result<Self> {
         let server_cert_key = config.server_cert_key.ok_or_else(|| {
-            io::Error::new(ErrorKind::Other, "Socks5 tls server certificate is missing")
+            io::Error::new(ErrorKind::Other, "socks5 tls server certificate is missing")
         })?;
         let tls_config = load_tls_config(server_cert_key, config.client_cert_path).await?;
         let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
@@ -79,6 +66,15 @@ impl Socks5OverTlsProxyServer {
             tls_acceptor,
         };
         Ok(server)
+    }
+
+    pub async fn start(self) -> io::Result<()> {
+        info!("listening on socks5://{}", self.bind_addr);
+        server_start(
+            self.bind_addr,
+            self.auth,
+            Some(self.tls_acceptor),
+        ).await
     }
 }
 
@@ -788,7 +784,7 @@ async fn server_start(
             .await;
 
             if let Err(e) = res {
-                error!("{} -> {}", peer_addr, e)
+                error!("socks5 server error: {}; bind: {}; peer: {}", e, bind_addr, peer_addr);
             }
         });
     }
