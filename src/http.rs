@@ -171,7 +171,6 @@ async fn server_start(
                     }
                 }
             };
-            
 
             if let Err(e) = fut.await {
                 error!("http server error: {}; bind: {}; peer: {}", e, bind_addr, peer);

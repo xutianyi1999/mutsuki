@@ -764,7 +764,7 @@ async fn server_start(
         let tls_acceptor_op = tls_acceptor.clone();
 
         tokio::spawn(async move {
-            let res = async move {
+            let res = async {
                 stream.set_keepalive()?;
 
                 match tls_acceptor_op {
