@@ -69,7 +69,7 @@ impl Socks5OverTlsProxyServer {
     }
 
     pub async fn start(self) -> io::Result<()> {
-        info!("listening on socks5://{}", self.bind_addr);
+        info!("listening on socks5_over_tls://{}", self.bind_addr);
         server_start(
             self.bind_addr,
             self.auth,
