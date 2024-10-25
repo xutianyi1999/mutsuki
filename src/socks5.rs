@@ -459,7 +459,7 @@ struct Socks5Handler<'a, RW> {
     auth: Option<Arc<Auth>>,
 }
 
-impl<'a, RW: AsyncRead + AsyncWrite + Unpin> Socks5Handler<'a, RW> {
+impl<'a, RW: AsyncRead + AsyncWrite + Unpin + 'static> Socks5Handler<'a, RW> {
     fn new(stream: &'a mut RW, peer_addr: SocketAddr, auth: Option<Arc<Auth>>) -> Self {
         Socks5Handler {
             buff: vec![0u8; 1024].into_boxed_slice(),
@@ -743,6 +743,15 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin> Socks5Handler<'a, RW> {
 
         match self.accept().await? {
             Cmd::TCP(mut dst_stream) => {
+                #[cfg(target_os = "linux")]
+                {
+                    let source: &mut dyn std::any::Any = self.stream;
+                    if let Some(source) = source.downcast_mut::<TcpStream>() {
+                        tokio_splice::zero_copy_bidirectional(source, &mut dst_stream).await?;
+                        return Ok(());
+                    }
+                }
+
                 tokio::io::copy_bidirectional(self.stream, &mut dst_stream).await?;
                 Ok(())
             }
