@@ -37,7 +37,7 @@ fn auth<T>(auth_opt: Option<&Auth>, req: &Request<T>) -> Result<(), StatusCode> 
                 )
                 .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-                let mut list = credentials.split(':');
+                let mut list = credentials.splitn(2, ':');
 
                 let req_username_op = list.next();
                 let req_password_op = list.next();

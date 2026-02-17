@@ -331,7 +331,7 @@ struct UdpProxyPacket<'a> {
 }
 
 impl UdpProxyPacket<'_> {
-    fn decode(packet: &[u8]) -> io::Result<UdpProxyPacket> {
+    fn decode(packet: &[u8]) -> io::Result<UdpProxyPacket<'_>> {
         let frag = packet[2];
         let addr_type = packet[3];
 
