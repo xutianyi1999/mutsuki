@@ -563,10 +563,17 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin + 'static> Socks5Handler<'a, RW> {
                 version: SOCKS5_VERSION,
                 methods: code,
             },
-            None => NegotiateResponse {
-                version: SOCKS5_VERSION,
-                methods: NO_ACCEPTABLE_METHODS,
-            },
+            None => {
+                self.write_msg(NegotiateResponse {
+                    version: SOCKS5_VERSION,
+                    methods: NO_ACCEPTABLE_METHODS,
+                })
+                .await?;
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "No acceptable methods",
+                ));
+            }
         };
         self.write_msg(msg).await
     }
@@ -605,7 +612,15 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin + 'static> Socks5Handler<'a, RW> {
             }
         };
 
-        self.write_msg(resp).await
+        let failed = resp.status == FAILED;
+        self.write_msg(resp).await?;
+        if failed {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "Authentication failed",
+            ));
+        }
+        Ok(())
     }
 
     async fn accept(&mut self) -> io::Result<Cmd> {
