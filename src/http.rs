@@ -27,7 +27,7 @@ fn auth<T>(auth_opt: Option<&Auth>, req: &Request<T>) -> Result<(), StatusCode> 
         match req.headers().get(http::header::PROXY_AUTHORIZATION) {
             Some(head_value) => {
                 let head_str = head_value.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
-                let Ok((_, credentials)) = sscanf::scanf!(head_str, "{} {}", str, str) else {
+                let Some((_, credentials)) = sscanf::sscanf!(head_str, "{} {}", str, str) else {
                     return Err(StatusCode::BAD_REQUEST);
                 };
                 let credentials = String::from_utf8(
