@@ -159,7 +159,18 @@ impl<'a> AuthRequest<'a> {
         rx.read_exact(username_buff).await?;
 
         let password_len = rx.read_u8().await?;
-        let password_range = username_len as usize..(username_len + password_len) as usize;
+        let username_len_usize = username_len as usize;
+        let password_len_usize = password_len as usize;
+        let total_len = username_len_usize
+            .checked_add(password_len_usize)
+            .filter(|&n| n <= buff.len())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Username and password total length exceeds buffer or overflows",
+                )
+            })?;
+        let password_range = username_len_usize..total_len;
         let password_buff = get_mut!(&mut *buff, password_range.clone(), "Password too long");
         rx.read_exact(password_buff).await?;
 
@@ -755,7 +766,8 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin + 'static> Socks5Handler<'a, RW> {
         let buff = &mut *self.buff;
 
         let f1 = async move {
-            let _ = stream.read_u8().await;
+            let mut buf = [0u8; 256];
+            while stream.read(&mut buf).await? > 0 {}
             Ok(())
         };
 
