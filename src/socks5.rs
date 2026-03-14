@@ -248,8 +248,15 @@ impl<'a> AcceptRequest<'a> {
                 (Socks5Addr::Ip(dest_addr), port)
             }
             DOMAIN_NAME => {
+                const MAX_DOMAIN_LEN: usize = 255;
                 let len = rx.read_u8().await? as usize;
-                let buff = get_mut!(buff, ..len + 2);
+                if len > MAX_DOMAIN_LEN {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Domain name length exceeds 255",
+                    ));
+                }
+                let buff = get_mut!(buff, ..len + 2, "Domain name too long");
 
                 rx.read_exact(buff).await?;
 
@@ -332,25 +339,67 @@ struct UdpProxyPacket<'a> {
 
 impl UdpProxyPacket<'_> {
     fn decode(packet: &[u8]) -> io::Result<UdpProxyPacket<'_>> {
+        const MIN_HEADER: usize = 4; // RSV(2) + FRAG(1) + ATYP(1)
+        if packet.len() < MIN_HEADER {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UDP packet too short",
+            ));
+        }
+
         let frag = packet[2];
         let addr_type = packet[3];
 
         let (dest_addr, start) = match addr_type {
             IPV4 => {
+                const IPV4_MIN_LEN: usize = MIN_HEADER + 4 + 2; // + addr + port
+                if packet.len() < IPV4_MIN_LEN {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "UDP packet too short for IPv4 address",
+                    ));
+                }
                 let mut ipv4_addr_buff = [0u8; 4];
                 ipv4_addr_buff.copy_from_slice(&packet[4..8]);
 
                 (Socks5Addr::Ip(IpAddr::from(ipv4_addr_buff)), 8)
             }
             IPV6 => {
+                const IPV6_MIN_LEN: usize = MIN_HEADER + 16 + 2; // + addr + port
+                if packet.len() < IPV6_MIN_LEN {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "UDP packet too short for IPv6 address",
+                    ));
+                }
                 let mut ipv6_addr_buff = [0u8; 16];
                 ipv6_addr_buff.copy_from_slice(&packet[4..20]);
 
                 (Socks5Addr::Ip(IpAddr::from(ipv6_addr_buff)), 20)
             }
             DOMAIN_NAME => {
+                const MAX_DOMAIN_LEN: usize = 255;
+                if packet.len() < MIN_HEADER + 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "UDP packet too short for domain name length",
+                    ));
+                }
                 let domain_name_len = packet[4] as usize;
+                if domain_name_len > MAX_DOMAIN_LEN {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "UDP packet domain name length exceeds 255",
+                    ));
+                }
                 let domain_end = 5 + domain_name_len;
+                let port_end = domain_end + 2;
+                if packet.len() < port_end {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "UDP packet too short for domain name and port",
+                    ));
+                }
                 let domain_name = String::from_utf8_lossy(&packet[5..domain_end]);
 
                 (Socks5Addr::DomainName(domain_name), domain_end)
@@ -363,6 +412,12 @@ impl UdpProxyPacket<'_> {
             }
         };
 
+        if packet.len() < start + 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "UDP packet too short for port",
+            ));
+        }
         let mut port_buff = [0u8; 2];
         port_buff.copy_from_slice(&packet[start..(start + 2)]);
         let dest_port = u16::from_be_bytes(port_buff);
@@ -634,21 +689,17 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin + 'static> Socks5Handler<'a, RW> {
                 Ok(Cmd::TCP(dest_stream))
             }
             UDP => {
-                let bind_addr = match request.dest_addr {
-                    Socks5Addr::Ip(ip) => SocketAddr::from((ip, request.port)),
-                    Socks5Addr::DomainName(domain) => lookup_host((&*domain, request.port))
-                        .await?
-                        .next()
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::Other, "Resolve dst domain name error")
-                        })?,
+                // Per RFC 1928: server binds a local UDP socket and returns BND.ADDR:BND.PORT.
+                // DST.ADDR/DST.PORT in request are client's expected source (or 0), not bind target.
+                let bind_addr = match self.peer_addr {
+                    SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+                    SocketAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
                 };
 
                 let udp_socket = UdpSocket::bind(bind_addr).await?;
                 let local_addr = udp_socket.local_addr()?;
 
                 let local_addr = if local_addr.ip().is_unspecified() {
-                    // TODO maybe bind ipv4 ipv6 address type not match
                     let local_to_peer_ip = get_interface_addr(self.peer_addr).await?;
                     SocketAddr::new(local_to_peer_ip, local_addr.port())
                 } else {
