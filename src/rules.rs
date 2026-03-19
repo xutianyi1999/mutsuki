@@ -75,7 +75,9 @@ impl RuleMatcher {
         let host = host.to_string();
         tokio::task::spawn_blocking(move || {
             let (reply_tx, reply_rx) = oneshot::channel();
-            let _ = tx.send((host, reply_tx));
+            if tx.send((host, reply_tx)).is_err() {
+                return false;
+            }
             reply_rx.blocking_recv().unwrap_or(false)
         })
         .await
