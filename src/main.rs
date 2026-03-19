@@ -17,6 +17,8 @@ use tokio::fs;
 
 mod common;
 mod http;
+mod outbound;
+mod rules;
 mod socks5;
 
 #[global_allocator]
@@ -29,6 +31,10 @@ pub struct ProxyConfig {
     auth: Option<Auth>,
     server_cert_key: Option<ServerCertKey>,
     client_cert_path: Option<String>,
+    /// gfwlist-style rules file path; used with upstream for traffic split.
+    rules_file: Option<String>,
+    /// Upstream proxy URL, e.g. socks5://127.0.0.1:10800 or http://127.0.0.1:8080.
+    upstream: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -85,16 +91,41 @@ async fn process() -> io::Result<()> {
 }
 
 async fn match_server(config: ProxyConfig) -> io::Result<()> {
+    let rules_matcher = config
+        .rules_file
+        .as_ref()
+        .map(|path| rules::RuleMatcher::start(path.clone()))
+        .transpose()?;
+    let upstream = config
+        .upstream
+        .as_ref()
+        .map(|u| outbound::parse_upstream(u))
+        .transpose()?
+        .map(std::sync::Arc::new);
+
     match config.protocol.as_str() {
-        "socks5" => socks5::Socks5ProxyServer::new(config).start().await,
+        "socks5" => {
+            socks5::Socks5ProxyServer::new(config, rules_matcher, upstream)
+                .start()
+                .await
+        }
         "socks5_over_tls" => {
-            socks5::Socks5OverTlsProxyServer::new(config)
+            socks5::Socks5OverTlsProxyServer::new(config, rules_matcher, upstream)
                 .await?
                 .start()
                 .await
         }
-        "http" => http::HttpProxyServer::new(config).start().await,
-        "https" => http::HttpsProxyServer::new(config).await?.start().await,
+        "http" => {
+            http::HttpProxyServer::new(config, rules_matcher, upstream)
+                .start()
+                .await
+        }
+        "https" => {
+            http::HttpsProxyServer::new(config, rules_matcher, upstream)
+                .await?
+                .start()
+                .await
+        }
         _ => Err(io::Error::new(
             ErrorKind::InvalidInput,
             "invalid proxy protocol",

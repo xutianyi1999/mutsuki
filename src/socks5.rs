@@ -5,11 +5,13 @@ use std::result::Result::Err;
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ErrorKind};
-use tokio::net::{lookup_host, TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, UdpSocket};
 use tokio_rustls::TlsAcceptor;
 
 use crate::common::{load_tls_config, SocketExt};
-use crate::{Auth,  ProxyConfig};
+use crate::outbound::{self, OutboundStream};
+use crate::rules::RuleMatcher;
+use crate::{Auth, ProxyConfig};
 
 const SOCKS5_VERSION: u8 = 0x05;
 const IPV4: u8 = 0x01;
@@ -30,19 +32,34 @@ macro_rules! get_mut {
 pub struct Socks5ProxyServer {
     bind_addr: SocketAddr,
     auth: Option<Arc<Auth>>,
+    rules_matcher: Option<RuleMatcher>,
+    upstream: Option<Arc<outbound::UpstreamConfig>>,
 }
 
 impl Socks5ProxyServer {
-    pub fn new(config: ProxyConfig) -> Self {
+    pub fn new(
+        config: ProxyConfig,
+        rules_matcher: Option<RuleMatcher>,
+        upstream: Option<Arc<outbound::UpstreamConfig>>,
+    ) -> Self {
         Socks5ProxyServer {
             bind_addr: config.bind_addr,
             auth: config.auth.map(Arc::new),
+            rules_matcher,
+            upstream,
         }
     }
 
     pub async fn start(self) -> io::Result<()> {
         info!("listening on socks5://{}", self.bind_addr);
-        server_start(self.bind_addr, self.auth, None).await
+        server_start(
+            self.bind_addr,
+            self.auth,
+            None,
+            self.rules_matcher,
+            self.upstream,
+        )
+        .await
     }
 }
 
@@ -50,10 +67,16 @@ pub struct Socks5OverTlsProxyServer {
     bind_addr: SocketAddr,
     auth: Option<Arc<Auth>>,
     tls_acceptor: TlsAcceptor,
+    rules_matcher: Option<RuleMatcher>,
+    upstream: Option<Arc<outbound::UpstreamConfig>>,
 }
 
 impl Socks5OverTlsProxyServer {
-    pub async fn new(config: ProxyConfig) -> io::Result<Self> {
+    pub async fn new(
+        config: ProxyConfig,
+        rules_matcher: Option<RuleMatcher>,
+        upstream: Option<Arc<outbound::UpstreamConfig>>,
+    ) -> io::Result<Self> {
         let server_cert_key = config.server_cert_key.ok_or_else(|| {
             io::Error::new(ErrorKind::Other, "socks5 tls server certificate is missing")
         })?;
@@ -64,6 +87,8 @@ impl Socks5OverTlsProxyServer {
             bind_addr: config.bind_addr,
             auth: config.auth.map(Arc::new),
             tls_acceptor,
+            rules_matcher,
+            upstream,
         };
         Ok(server)
     }
@@ -74,7 +99,10 @@ impl Socks5OverTlsProxyServer {
             self.bind_addr,
             self.auth,
             Some(self.tls_acceptor),
-        ).await
+            self.rules_matcher,
+            self.upstream,
+        )
+        .await
     }
 }
 
@@ -335,7 +363,7 @@ impl Encode for AcceptResponse<'_> {
 }
 
 enum Cmd {
-    TCP(TcpStream),
+    TCP(OutboundStream),
     UDP(UdpSocket),
 }
 
@@ -523,15 +551,25 @@ struct Socks5Handler<'a, RW> {
     stream: &'a mut RW,
     peer_addr: SocketAddr,
     auth: Option<Arc<Auth>>,
+    rules_matcher: Option<RuleMatcher>,
+    upstream: Option<Arc<outbound::UpstreamConfig>>,
 }
 
 impl<'a, RW: AsyncRead + AsyncWrite + Unpin + 'static> Socks5Handler<'a, RW> {
-    fn new(stream: &'a mut RW, peer_addr: SocketAddr, auth: Option<Arc<Auth>>) -> Self {
+    fn new(
+        stream: &'a mut RW,
+        peer_addr: SocketAddr,
+        auth: Option<Arc<Auth>>,
+        rules_matcher: Option<RuleMatcher>,
+        upstream: Option<Arc<outbound::UpstreamConfig>>,
+    ) -> Self {
         Socks5Handler {
             buff: vec![0u8; 1024].into_boxed_slice(),
             stream,
             peer_addr,
             auth,
+            rules_matcher,
+            upstream,
         }
     }
 
@@ -662,20 +700,26 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin + 'static> Socks5Handler<'a, RW> {
 
         match request.cmd {
             TCP => {
-                let dst_addr = match request.dest_addr {
-                    Socks5Addr::Ip(ip) => SocketAddr::from((ip, request.port)),
-                    Socks5Addr::DomainName(domain) => lookup_host((&*domain, request.port))
-                        .await?
-                        .next()
-                        .ok_or_else(|| {
-                            io::Error::new(io::ErrorKind::Other, "Resolve dst domain name error")
-                        })?,
+                let (host_str, port) = match &request.dest_addr {
+                    Socks5Addr::Ip(ip) => (ip.to_string(), request.port),
+                    Socks5Addr::DomainName(d) => (d.to_string(), request.port),
+                };
+                let use_upstream = if let Some(ref m) = self.rules_matcher {
+                    m.matches_proxy(&host_str).await
+                } else {
+                    // No rules matcher but upstream configured → all traffic via upstream
+                    self.upstream.is_some()
+                };
+                let upstream_opt = if use_upstream {
+                    self.upstream.as_deref()
+                } else {
+                    None
                 };
 
-                let res = TcpStream::connect(dst_addr).await;
+                let res = outbound::connect_target(upstream_opt, &host_str, port).await;
 
-                let dest_stream = match res {
-                    Ok(dest_stream) => dest_stream,
+                let mut dest_stream = match res {
+                    Ok(s) => s,
                     Err(err) => {
                         let err_code = match err.kind() {
                             ErrorKind::NotFound | ErrorKind::NotConnected => 0x03,
@@ -687,19 +731,28 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin + 'static> Socks5Handler<'a, RW> {
                             ErrorKind::AddrNotAvailable => 0x08,
                             _ => 0x01,
                         };
-
                         let resp = build_err_resp(err_code);
                         self.write_msg(resp).await?;
                         return Err(err);
                     }
                 };
 
-                dest_stream.set_keepalive()?;
-                let local_addr = dest_stream.local_addr()?;
-
-                let addr_type = match local_addr {
-                    SocketAddr::V4(_) => IPV4,
-                    SocketAddr::V6(_) => IPV6,
+                let (addr_type, bind_addr, bind_port) = match &mut dest_stream {
+                    OutboundStream::Direct(s) => {
+                        s.set_keepalive()?;
+                        let local_addr = s.local_addr()?;
+                        (
+                            match local_addr {
+                                SocketAddr::V4(_) => IPV4,
+                                SocketAddr::V6(_) => IPV6,
+                            },
+                            Socks5Addr::Ip(local_addr.ip()),
+                            local_addr.port(),
+                        )
+                    }
+                    OutboundStream::Socks5(_) => {
+                        (IPV4, Socks5Addr::Ip(IpAddr::from([0, 0, 0, 0])), 0)
+                    }
                 };
 
                 let resp_msg = AcceptResponse {
@@ -707,8 +760,8 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin + 'static> Socks5Handler<'a, RW> {
                     rep: SUCCESS,
                     rsv: 0x00,
                     bind_addr_type: addr_type,
-                    bind_addr: Socks5Addr::Ip(local_addr.ip()),
-                    bind_port: local_addr.port(),
+                    bind_addr,
+                    bind_port,
                 };
 
                 self.write_msg(resp_msg).await?;
@@ -821,15 +874,6 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin + 'static> Socks5Handler<'a, RW> {
 
         match self.accept().await? {
             Cmd::TCP(mut dst_stream) => {
-                #[cfg(target_os = "linux")]
-                {
-                    let source: &mut dyn std::any::Any = self.stream;
-                    if let Some(source) = source.downcast_mut::<TcpStream>() {
-                        tokio_splice::zero_copy_bidirectional(source, &mut dst_stream).await?;
-                        return Ok(());
-                    }
-                }
-
                 tokio::io::copy_bidirectional(self.stream, &mut dst_stream).await?;
                 Ok(())
             }
@@ -842,6 +886,8 @@ async fn server_start(
     bind_addr: SocketAddr,
     auth: Option<Arc<Auth>>,
     tls_acceptor: Option<TlsAcceptor>,
+    rules_matcher: Option<RuleMatcher>,
+    upstream: Option<Arc<outbound::UpstreamConfig>>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
 
@@ -849,6 +895,8 @@ async fn server_start(
         let (mut stream, peer_addr) = listener.accept().await?;
         let auth = auth.clone();
         let tls_acceptor_op = tls_acceptor.clone();
+        let rules_matcher = rules_matcher.clone();
+        let upstream = upstream.clone();
 
         tokio::spawn(async move {
             let res = async {
@@ -857,14 +905,26 @@ async fn server_start(
                 match tls_acceptor_op {
                     Some(acceptor) => {
                         let mut tls_stream = acceptor.accept(stream).await?;
-                        Socks5Handler::new(&mut tls_stream, peer_addr, auth)
-                            .exec()
-                            .await
+                        Socks5Handler::new(
+                            &mut tls_stream,
+                            peer_addr,
+                            auth,
+                            rules_matcher,
+                            upstream,
+                        )
+                        .exec()
+                        .await
                     }
                     None => {
-                        Socks5Handler::new(&mut stream, peer_addr, auth)
-                            .exec()
-                            .await
+                        Socks5Handler::new(
+                            &mut stream,
+                            peer_addr,
+                            auth,
+                            rules_matcher,
+                            upstream,
+                        )
+                        .exec()
+                        .await
                     }
                 }
             }

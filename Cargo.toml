@@ -21,9 +21,9 @@ tokio-rustls = "0.26"
 rustls-pemfile = "2"
 sscanf = "0.5"
 mimalloc = { version = "*", default-features = false }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-tokio-splice = "0.2"
+adblock = "0.12"
+url = "2"
+fast-socks5 = { git = "https://github.com/dizda/fast-socks5.git" }
 
 [profile.release]
 lto = true

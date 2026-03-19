@@ -12,11 +12,13 @@ use hyper::service::service_fn;
 use hyper::{http, Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 
 use crate::common::{load_tls_config, SocketExt};
+use crate::outbound::{self, OutboundStream};
+use crate::rules::RuleMatcher;
 use crate::{Auth, ProxyConfig};
 
 fn auth<T>(auth_opt: Option<&Auth>, req: &Request<T>) -> Result<(), StatusCode> {
@@ -57,9 +59,31 @@ fn auth<T>(auth_opt: Option<&Auth>, req: &Request<T>) -> Result<(), StatusCode> 
     Ok(())
 }
 
+fn parse_host_port(authority: &str) -> (String, u16) {
+    if let Some((host, port_str)) = authority.rsplit_once(':') {
+        if let Ok(port) = port_str.parse::<u16>() {
+            return (host.to_string(), port);
+        }
+    }
+    (authority.to_string(), 80)
+}
+
+fn is_ip_host(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>().is_ok()
+}
+
+fn set_keepalive_on_outbound(s: &mut OutboundStream) -> io::Result<()> {
+    match s {
+        OutboundStream::Direct(t) => t.set_keepalive(),
+        OutboundStream::Socks5(_) => Ok(()),
+    }
+}
+
 async fn proxy(
     req: Request<hyper::body::Incoming>,
     auth_opt: Option<&Auth>,
+    rules_matcher: Option<RuleMatcher>,
+    upstream: Option<Arc<outbound::UpstreamConfig>>,
 ) -> hyper::Result<Response<Either<Full<Bytes>, hyper::body::Incoming>>> {
     if let Err(resp_code) = auth(auth_opt.as_deref(), &req) {
         let mut resp = Response::new(Either::Left(Full::new(Bytes::new())));
@@ -67,36 +91,56 @@ async fn proxy(
         return Ok(resp);
     }
 
-    let Some(dst_addr) = req.uri().authority().map(|v| v.to_string()) else {
+    let Some(dst_authority) = req.uri().authority().map(|v| v.to_string()) else {
         let mut resp = Response::new(Either::Left(Full::new(Bytes::new())));
         *resp.status_mut() = StatusCode::BAD_REQUEST;
         return Ok(resp);
     };
 
+    let (host, port) = parse_host_port(&dst_authority);
+    let use_upstream = if let Some(ref m) = rules_matcher {
+        !is_ip_host(&host) && m.matches_proxy(&host).await
+    } else {
+        // No rules matcher but upstream configured → all traffic via upstream
+        upstream.is_some()
+    };
+    let upstream_opt = if use_upstream {
+        upstream.as_deref()
+    } else {
+        None
+    };
+
     if Method::CONNECT == req.method() {
+        let dst_authority = dst_authority.clone();
+        let host = host.clone();
+        let upstream_for_connect = if use_upstream {
+            upstream.clone()
+        } else {
+            None
+        };
         tokio::spawn(async move {
-            let res= async {
-                let upgraded = hyper::upgrade::on(req).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            let res = async {
+                let upgraded =
+                    hyper::upgrade::on(req).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
                 let mut source_stream = TokioIo::new(upgraded);
-
-                let mut dst_stream = TcpStream::connect(&dst_addr).await?;
-                dst_stream.set_keepalive()?;
-
+                let u = upstream_for_connect.as_deref();
+                let mut dst_stream = outbound::connect_target(u, &host, port).await?;
+                set_keepalive_on_outbound(&mut dst_stream)?;
                 tokio::io::copy_bidirectional(&mut source_stream, &mut dst_stream).await?;
                 Ok::<_, io::Error>(())
             }
             .await;
 
             if let Err(e) = res {
-                error!("proxy error: {}; peer: {}", e, dst_addr);
+                error!("proxy error: {}; peer: {}", e, dst_authority);
             }
         });
         Ok(Response::new(Either::Left(Full::new(Bytes::new()))))
     } else {
         let fut = async {
-            let stream = TcpStream::connect(dst_addr).await?;
-            stream.set_keepalive()?;
-            let io = TokioIo::new(stream);
+            let mut dst_stream = outbound::connect_target(upstream_opt, &host, port).await?;
+            set_keepalive_on_outbound(&mut dst_stream)?;
+            let io = TokioIo::new(dst_stream);
 
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
                 .preserve_header_case(true)
@@ -128,11 +172,15 @@ async fn proxy(
 pub struct HttpProxyServer {
     bind_addr: SocketAddr,
     auth: Option<Arc<Auth>>,
+    rules_matcher: Option<RuleMatcher>,
+    upstream: Option<Arc<outbound::UpstreamConfig>>,
 }
 
 async fn child<RW: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
     auth_opt: Option<Arc<Auth>>,
     source: RW,
+    rules_matcher: Option<RuleMatcher>,
+    upstream: Option<Arc<outbound::UpstreamConfig>>,
 ) -> io::Result<()> {
     let io = TokioIo::new(source);
     let auth_opt = auth_opt.as_deref();
@@ -140,7 +188,10 @@ async fn child<RW: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
     http1::Builder::new()
         .preserve_header_case(true)
         .title_case_headers(true)
-        .serve_connection(io, service_fn(move |req| proxy(req, auth_opt)))
+        .serve_connection(
+            io,
+            service_fn(move |req| proxy(req, auth_opt, rules_matcher.clone(), upstream.clone())),
+        )
         .with_upgrades()
         .await
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
@@ -151,6 +202,8 @@ async fn server_start(
     bind_addr: SocketAddr,
     auth: Option<Arc<Auth>>,
     tls_acceptor: Option<TlsAcceptor>,
+    rules_matcher: Option<RuleMatcher>,
+    upstream: Option<Arc<outbound::UpstreamConfig>>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(bind_addr).await?;
 
@@ -158,16 +211,18 @@ async fn server_start(
         let (stream, peer) = listener.accept().await?;
         let auth = auth.clone();
         let tls_acceptor = tls_acceptor.clone();
+        let rules_matcher = rules_matcher.clone();
+        let upstream = upstream.clone();
 
         tokio::spawn(async move {
             let fut = async {
                 stream.set_keepalive()?;
 
                 match tls_acceptor {
-                    None => child(auth, stream).await,
+                    None => child(auth, stream, rules_matcher, upstream).await,
                     Some(acceptor) => {
                         let stream = acceptor.accept(stream).await?;
-                        child(auth, stream).await
+                        child(auth, stream, rules_matcher, upstream).await
                     }
                 }
             };
@@ -180,16 +235,29 @@ async fn server_start(
 }
 
 impl HttpProxyServer {
-    pub fn new(config: ProxyConfig) -> Self {
+    pub fn new(
+        config: ProxyConfig,
+        rules_matcher: Option<RuleMatcher>,
+        upstream: Option<Arc<outbound::UpstreamConfig>>,
+    ) -> Self {
         HttpProxyServer {
             bind_addr: config.bind_addr,
             auth: config.auth.map(Arc::new),
+            rules_matcher,
+            upstream,
         }
     }
 
     pub async fn start(self) -> io::Result<()> {
         info!("listening on http://{}", self.bind_addr);
-        server_start(self.bind_addr, self.auth, None).await
+        server_start(
+            self.bind_addr,
+            self.auth,
+            None,
+            self.rules_matcher,
+            self.upstream,
+        )
+        .await
     }
 }
 
@@ -197,10 +265,16 @@ pub struct HttpsProxyServer {
     bind_addr: SocketAddr,
     auth: Option<Arc<Auth>>,
     tls_config: Arc<ServerConfig>,
+    rules_matcher: Option<RuleMatcher>,
+    upstream: Option<Arc<outbound::UpstreamConfig>>,
 }
 
 impl HttpsProxyServer {
-    pub async fn new(config: ProxyConfig) -> io::Result<Self> {
+    pub async fn new(
+        config: ProxyConfig,
+        rules_matcher: Option<RuleMatcher>,
+        upstream: Option<Arc<outbound::UpstreamConfig>>,
+    ) -> io::Result<Self> {
         let server_cert_key = config
             .server_cert_key
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Server certificate is missing"))?;
@@ -210,6 +284,8 @@ impl HttpsProxyServer {
             bind_addr: config.bind_addr,
             auth: config.auth.map(Arc::new),
             tls_config: Arc::new(tls_config),
+            rules_matcher,
+            upstream,
         };
         Ok(https_proxy_server)
     }
@@ -217,6 +293,13 @@ impl HttpsProxyServer {
     pub async fn start(self) -> io::Result<()> {
         info!("listening on https://{}", self.bind_addr);
         let tls_acceptor = TlsAcceptor::from(self.tls_config);
-        server_start(self.bind_addr, self.auth, Some(tls_acceptor)).await
+        server_start(
+            self.bind_addr,
+            self.auth,
+            Some(tls_acceptor),
+            self.rules_matcher,
+            self.upstream,
+        )
+        .await
     }
 }

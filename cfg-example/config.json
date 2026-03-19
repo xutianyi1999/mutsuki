@@ -1,5 +1,11 @@
 [
   {
+    "protocol": "socks5",
+    "bind_addr": "127.0.0.1:1080",
+    "rules_file": "C:/path/to/gfwlist.dat",
+    "upstream": "socks5://127.0.0.1:10800"
+  },
+  {
     "protocol": "https",
     "bind_addr": "127.0.0.1:10800",
     "server_cert_key": {
