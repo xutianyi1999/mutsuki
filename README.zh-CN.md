@@ -1,5 +1,7 @@
 # mutsuki
 
+**语言 / Language:** [English](README.md) · 简体中文
+
 基于 Rust 的代理服务器，支持 SOCKS5、HTTP 及 TLS。可配合规则文件实现分流：直连或经上游代理。
 
 ## 功能

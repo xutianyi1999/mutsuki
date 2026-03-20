@@ -1,5 +1,7 @@
 # mutsuki
 
+**Language / 语言:** English · [简体中文](README.zh-CN.md)
+
 A Rust proxy server supporting SOCKS5, HTTP, and TLS. Use a rules file to split traffic: direct or via an upstream proxy.
 
 ## Features
