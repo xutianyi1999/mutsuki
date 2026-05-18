@@ -8,7 +8,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adblock::Engine;
 use adblock::lists::ParseOptions;
@@ -62,6 +62,8 @@ impl RuleMatcher {
         let watch_path = PathBuf::from(&path);
         let file_name = watch_path.file_name().map(|n| n.to_os_string());
 
+        const DEBOUNCE_MS: u64 = 500;
+
         thread::spawn(move || {
             let mut engine = match load_engine_blocking(&path) {
                 Ok(engine) => {
@@ -103,6 +105,8 @@ impl RuleMatcher {
                     }
                 };
 
+            let mut last_reload = Instant::now();
+
             loop {
                 // Process file change events (non-blocking)
                 while let Ok(Ok(event)) = event_rx.try_recv() {
@@ -116,6 +120,11 @@ impl RuleMatcher {
                         _ => false,
                     };
                     if changed {
+                        let now = Instant::now();
+                        if now < last_reload + Duration::from_millis(DEBOUNCE_MS) {
+                            continue;
+                        }
+                        last_reload = now;
                         match load_engine_blocking(&path) {
                             Ok(new_engine) => {
                                 engine = new_engine;
