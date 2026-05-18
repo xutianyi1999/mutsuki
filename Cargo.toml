@@ -23,6 +23,7 @@ sscanf = "0.5"
 mimalloc = { version = "*", default-features = false }
 adblock = "0.12"
 url = "2"
+notify = "8"
 fast-socks5 = { git = "https://github.com/dizda/fast-socks5.git" }
 
 [profile.release]

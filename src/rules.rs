@@ -2,14 +2,19 @@
 //! Compatible with gfwlist.dat: skip empty lines, `!` comments, `[` metadata.
 //! Rules can match both domain names and IP addresses (e.g. `||example.com`, `||1.2.3.4`).
 //! RuleMatcher runs the adblock Engine in a dedicated thread (Engine is !Send).
+//! The rules file is automatically watched for changes and hot-reloaded.
 
 use std::io;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 use adblock::Engine;
 use adblock::lists::ParseOptions;
 use adblock::request::Request;
+use log::{error, info, warn};
+use notify::{Event, EventKind, RecursiveMode, Watcher};
 use tokio::sync::oneshot;
 
 /// Load rules from a gfwlist-style file (blocking, for use in matcher thread).
@@ -42,29 +47,98 @@ pub fn matches_proxy_sync(engine: &Engine, host: &str) -> bool {
 }
 
 /// Send-safe rule matcher: runs the engine in a dedicated thread, answers via channel.
+/// Automatically watches the rules file for changes and hot-reloads the engine.
 #[derive(Clone)]
 pub struct RuleMatcher {
     tx: mpsc::Sender<(String, oneshot::Sender<bool>)>,
 }
 
 impl RuleMatcher {
-    /// Start the matcher thread with the given rules file path. Returns None if load fails.
+    /// Start the matcher thread with the given rules file path.
+    /// The file is watched for changes and automatically reloaded on modification.
     pub fn start(path: String) -> io::Result<Self> {
         let (tx, rx) = mpsc::channel::<(String, oneshot::Sender<bool>)>();
         let (ready_tx, ready_rx) = mpsc::channel::<io::Result<()>>();
+        let watch_path = PathBuf::from(&path);
+        let file_name = watch_path.file_name().map(|n| n.to_os_string());
+
         thread::spawn(move || {
-            match load_engine_blocking(&path) {
+            let mut engine = match load_engine_blocking(&path) {
                 Ok(engine) => {
                     let _ = ready_tx.send(Ok(()));
-                    for (host, reply_tx) in rx.iter() {
-                        let _ = reply_tx.send(matches_proxy_sync(&engine, &host));
-                    }
+                    engine
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
+                    return;
+                }
+            };
+
+            // Set up file watcher for automatic hot-reload
+            let (event_tx, event_rx) = mpsc::channel::<notify::Result<Event>>();
+            let _watcher: Option<notify::RecommendedWatcher> =
+                match notify::recommended_watcher(move |res| {
+                    let _ = event_tx.send(res);
+                }) {
+                    Ok(mut w) => {
+                        if let Some(parent) = watch_path.parent() {
+                            let watch_dir = if parent.as_os_str().is_empty() {
+                                PathBuf::from(".")
+                            } else {
+                                parent.to_path_buf()
+                            };
+                            if let Err(e) =
+                                w.watch(&watch_dir, RecursiveMode::NonRecursive)
+                            {
+                                warn!("failed to watch directory {}: {}", watch_dir.display(), e);
+                            } else {
+                                info!("watching {} for rules file changes", watch_dir.display());
+                            }
+                        }
+                        Some(w)
+                    }
+                    Err(e) => {
+                        warn!("failed to create file watcher: {}; rules auto-reload disabled", e);
+                        None
+                    }
+                };
+
+            loop {
+                // Process file change events (non-blocking)
+                while let Ok(Ok(event)) = event_rx.try_recv() {
+                    let is_target = |p: &PathBuf| -> bool {
+                        p.file_name() == file_name.as_deref()
+                    };
+                    let changed = match event.kind {
+                        EventKind::Modify(_) | EventKind::Create(_) => {
+                            event.paths.iter().any(is_target)
+                        }
+                        _ => false,
+                    };
+                    if changed {
+                        match load_engine_blocking(&path) {
+                            Ok(new_engine) => {
+                                engine = new_engine;
+                                info!("rules file reloaded: {}", path);
+                            }
+                            Err(e) => {
+                                error!("failed to reload rules file {}: {}", path, e);
+                            }
+                        }
+                    }
+                }
+
+                // Process match queries with timeout to allow file event processing
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok((host, reply_tx)) => {
+                        let _ = reply_tx.send(matches_proxy_sync(&engine, &host));
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
         });
+
         ready_rx.recv().map_err(|_| io::Error::new(io::ErrorKind::Other, "matcher thread died"))??;
         Ok(RuleMatcher { tx })
     }
