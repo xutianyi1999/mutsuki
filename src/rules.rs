@@ -124,13 +124,15 @@ impl RuleMatcher {
                         if now < last_reload + Duration::from_millis(DEBOUNCE_MS) {
                             continue;
                         }
-                        last_reload = now;
                         match load_engine_blocking(&path) {
                             Ok(new_engine) => {
                                 engine = new_engine;
+                                last_reload = now;
                                 info!("rules file reloaded: {}", path);
                             }
+                            Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
                             Err(e) => {
+                                last_reload = now;
                                 error!("failed to reload rules file {}: {}", path, e);
                             }
                         }
