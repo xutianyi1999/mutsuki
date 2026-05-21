@@ -710,6 +710,7 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin + 'static> Socks5Handler<'a, RW> {
                     // No rules matcher but upstream configured → all traffic via upstream
                     self.upstream.is_some()
                 };
+                debug!("socks5 {} -> {}", host_str, if use_upstream { "proxy" } else { "direct" });
                 let upstream_opt = if use_upstream {
                     self.upstream.as_deref()
                 } else {

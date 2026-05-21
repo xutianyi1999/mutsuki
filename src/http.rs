@@ -104,6 +104,7 @@ async fn proxy(
         // No rules matcher but upstream configured → all traffic via upstream
         upstream.is_some()
     };
+    debug!("http {} -> {}", dst_authority, if use_upstream { "proxy" } else { "direct" });
     let upstream_opt = if use_upstream {
         upstream.as_deref()
     } else {
