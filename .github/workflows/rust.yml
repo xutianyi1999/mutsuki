@@ -39,7 +39,7 @@ jobs:
             os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: ilammy/setup-nasm@v1.5
+      - uses: ilammy/setup-nasm@v1
         if: matrix.os == 'windows-latest'
       - uses: actions/checkout@v7
       - uses: taiki-e/upload-rust-binary-action@v1
