@@ -3,46 +3,50 @@ name: Release
 on:
   push:
     tags:
-      - v[0-9]+.*
+      - v[0-9]+.[0-9]+.[0-9]+*
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   create-release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
       - uses: taiki-e/create-gh-release-action@v1
         env:
-          # (required)
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   upload-assets:
+    needs: create-release
     strategy:
       matrix:
         include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
           - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: ilammy/setup-nasm@v1
+      - uses: ilammy/setup-nasm@v1.5
         if: matrix.os == 'windows-latest'
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           target: ${{ matrix.target }}
-          # (required)
           bin: mutsuki
-          # (optional) On which platform to distribute the `.tar.gz` file.
-          # [default value: unix]
-          # [possible values: all, unix, windows, none]
           tar: unix
-          # (optional) On which platform to distribute the `.zip` file.
-          # [default value: windows]
-          # [possible values: all, unix, windows, none]
           zip: windows
         env:
-          # (required)
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
