@@ -101,6 +101,24 @@ impl AsyncWrite for OutboundStream {
     }
 }
 
+/// Format host:port for TcpStream. Wraps IPv6 literals in brackets.
+fn fmt_addr(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    }
+}
+
+/// Wrap an IPv6 literal in brackets, pass through otherwise.
+fn fmt_host(host: &str) -> String {
+    if host.contains(':') {
+        format!("[{}]", host)
+    } else {
+        host.to_string()
+    }
+}
+
 /// Connect to (host, port). If upstream is Some, connect via that proxy; otherwise direct.
 pub async fn connect_target(
     upstream: Option<&UpstreamConfig>,
@@ -108,12 +126,11 @@ pub async fn connect_target(
     port: u16,
 ) -> io::Result<OutboundStream> {
     let Some(up) = upstream else {
-        let addr = format!("{}:{}", host, port);
-        let stream = TcpStream::connect(addr).await?;
+        let stream = TcpStream::connect(fmt_addr(host, port)).await?;
         return Ok(OutboundStream::Direct(stream));
     };
 
-    let proxy_addr = format!("{}:{}", up.host, up.port);
+    let proxy_addr = fmt_addr(&up.host, up.port);
 
     if up.scheme == "socks5" {
         let config = Socks5Config::default();
@@ -128,6 +145,18 @@ pub async fn connect_target(
                     config,
                 )
                 .await
+            }
+            (Some(_), None) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "SOCKS5 upstream: username set but password missing",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "SOCKS5 upstream: password set but username missing",
+                ));
             }
             _ => Socks5Stream::connect(proxy_addr, host.to_string(), port, config).await,
         }
@@ -145,17 +174,30 @@ pub async fn connect_target(
         };
         let request = format!(
             "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}{}\r\n\r\n",
-            host,
+            fmt_host(host),
             port,
-            host,
+            fmt_host(host),
             port,
             auth_header
         );
         stream.write_all(request.as_bytes()).await?;
 
         let mut buf = [0u8; 1024];
-        let n = stream.read(&mut buf).await?;
-        let response = std::str::from_utf8(&buf[..n]).unwrap_or("");
+        let mut pos = 0;
+        loop {
+            if pos >= buf.len() {
+                return Err(io::Error::new(io::ErrorKind::Other, "CONNECT response headers too large"));
+            }
+            let n = stream.read(&mut buf[pos..]).await?;
+            if n == 0 {
+                break;
+            }
+            pos += n;
+            if pos >= 4 && &buf[pos - 4..pos] == b"\r\n\r\n" {
+                break;
+            }
+        }
+        let response = std::str::from_utf8(&buf[..pos]).unwrap_or("");
         let status = response
             .lines()
             .next()

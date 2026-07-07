@@ -24,7 +24,7 @@ mimalloc = { version = "*", default-features = false }
 adblock = "0.12"
 url = "2"
 notify = "8"
-fast-socks5 = { git = "https://github.com/dizda/fast-socks5.git" }
+fast-socks5 = { git = "https://github.com/dizda/fast-socks5.git", rev = "bae2fc05f993d3a247b5435ba7da221f3fd80a3c" }
 
 [profile.release]
 lto = true

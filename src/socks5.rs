@@ -387,6 +387,9 @@ impl UdpProxyPacket<'_> {
         }
 
         let frag = packet[2];
+        if frag != 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "UDP fragmentation not supported"));
+        }
         let addr_type = packet[3];
 
         let (dest_addr, start) = match addr_type {
@@ -729,7 +732,7 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin + 'static> Socks5Handler<'a, RW> {
                             ErrorKind::ConnectionAborted
                             | ErrorKind::ConnectionReset
                             | ErrorKind::TimedOut => 0x04,
-                            ErrorKind::AddrNotAvailable => 0x08,
+                            ErrorKind::AddrNotAvailable => 0x03,
                             _ => 0x01,
                         };
                         let resp = build_err_resp(err_code);
@@ -837,7 +840,7 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin + 'static> Socks5Handler<'a, RW> {
             while let Ok((len, peer_addr)) =
                 udp_socket.recv_from(&mut buff[data_range_start..]).await
             {
-                let (left, right) = buff.split_at_mut(data_range_start);
+                let (_, right) = buff.split_at_mut(data_range_start);
 
                 if peer_addr == source_addr {
                     proxy_server_to_dest(&right[..len], &udp_socket).await?;
@@ -846,18 +849,25 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin + 'static> Socks5Handler<'a, RW> {
                         IpAddr::V4(_) => IPV4,
                         IpAddr::V6(_) => IPV6,
                     };
+                    let header_size = match peer_addr.ip() {
+                        IpAddr::V4(_) => 10,
+                        IpAddr::V6(_) => 22,
+                    };
 
-                    let end = UdpProxyPacket {
+                    let total = header_size + len;
+                    let mut out = vec![0u8; total];
+                    let _ = UdpProxyPacket {
                         rsv: 0x0000,
                         frag: 0x00,
                         addr_type,
                         dest_addr: Socks5Addr::Ip(peer_addr.ip()),
                         dest_port: peer_addr.port(),
-                        data: &right[..len],
+                        data: &[],
                     }
-                    .encode(left);
+                    .encode(&mut out);
+                    out[header_size..].copy_from_slice(&right[..len]);
 
-                    udp_socket.send_to(&buff[..end], source_addr).await?;
+                    udp_socket.send_to(&out, source_addr).await?;
                 }
             }
             Ok(())

@@ -62,10 +62,11 @@ fn auth<T>(auth_opt: Option<&Auth>, req: &Request<T>) -> Result<(), StatusCode> 
 fn parse_host_port(authority: &str) -> (String, u16) {
     if let Some((host, port_str)) = authority.rsplit_once(':') {
         if let Ok(port) = port_str.parse::<u16>() {
+            let host = host.trim_start_matches('[').trim_end_matches(']');
             return (host.to_string(), port);
         }
     }
-    (authority.to_string(), 80)
+    (authority.trim_start_matches('[').trim_end_matches(']').to_string(), 80)
 }
 
 fn is_ip_host(host: &str) -> bool {
@@ -112,35 +113,45 @@ async fn proxy(
     };
 
     if Method::CONNECT == req.method() {
-        let dst_authority = dst_authority.clone();
-        let host = host.clone();
-        let upstream_for_connect = if use_upstream {
-            upstream.clone()
-        } else {
-            None
-        };
-        tokio::spawn(async move {
-            let res = async {
-                let upgraded =
-                    hyper::upgrade::on(req).await.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                let mut source_stream = TokioIo::new(upgraded);
-                let u = upstream_for_connect.as_deref();
-                let mut dst_stream = outbound::connect_target(u, &host, port).await?;
-                set_keepalive_on_outbound(&mut dst_stream)?;
-                tokio::io::copy_bidirectional(&mut source_stream, &mut dst_stream).await?;
-                Ok::<_, io::Error>(())
+        let mut dst_stream = match outbound::connect_target(upstream_opt, &host, port).await {
+            Ok(s) => s,
+            Err(e) => {
+                error!("connect error: {}; peer: {}", e, dst_authority);
+                let mut resp = Response::new(Either::Left(Full::new(Bytes::from("upstream error"))));
+                *resp.status_mut() = StatusCode::BAD_GATEWAY;
+                return Ok(resp);
             }
-            .await;
+        };
+        if let Err(e) = set_keepalive_on_outbound(&mut dst_stream) {
+            error!("set_keepalive error: {}; peer: {}", e, dst_authority);
+            let mut resp = Response::new(Either::Left(Full::new(Bytes::from("upstream error"))));
+            *resp.status_mut() = StatusCode::BAD_GATEWAY;
+            return Ok(resp);
+        }
 
-            if let Err(e) = res {
-                error!("proxy error: {}; peer: {}", e, dst_authority);
+        let dst_authority = dst_authority.clone();
+
+        tokio::spawn(async move {
+            match hyper::upgrade::on(req).await {
+                Ok(upgraded) => {
+                    let mut source_stream = TokioIo::new(upgraded);
+                    if let Err(e) = tokio::io::copy_bidirectional(&mut source_stream, &mut dst_stream).await {
+                        error!("proxy error: {}; peer: {}", e, dst_authority);
+                    }
+                }
+                Err(e) => error!("upgrade error: {}; peer: {}", e, dst_authority),
             }
         });
         Ok(Response::new(Either::Left(Full::new(Bytes::new()))))
     } else {
         let fut = async {
             let mut dst_stream = outbound::connect_target(upstream_opt, &host, port).await?;
-            set_keepalive_on_outbound(&mut dst_stream)?;
+            if let Err(e) = set_keepalive_on_outbound(&mut dst_stream) {
+                error!("set_keepalive error: {}; peer: {}", e, dst_authority);
+                let mut resp = Response::new(Either::Left(Full::new(Bytes::from("upstream error"))));
+                *resp.status_mut() = StatusCode::BAD_GATEWAY;
+                return Ok(resp);
+            }
             let io = TokioIo::new(dst_stream);
 
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
@@ -169,7 +180,8 @@ async fn proxy(
         match fut.await {
             Ok(resp) => Ok(resp),
             Err(e) => {
-                let mut resp = Response::new(Either::Left(Full::new(Bytes::from(e.to_string()))));
+                error!("proxy error: {}; peer: {}", e, dst_authority);
+                let mut resp = Response::new(Either::Left(Full::new(Bytes::from("upstream error"))));
                 *resp.status_mut() = StatusCode::BAD_GATEWAY;
                 Ok(resp)
             }
@@ -286,7 +298,8 @@ impl HttpsProxyServer {
         let server_cert_key = config
             .server_cert_key
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Server certificate is missing"))?;
-        let tls_config = load_tls_config(server_cert_key, config.client_cert_path).await?;
+        let mut tls_config = load_tls_config(server_cert_key, config.client_cert_path).await?;
+        tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
         let https_proxy_server = HttpsProxyServer {
             bind_addr: config.bind_addr,
