@@ -152,6 +152,13 @@ async fn proxy(
 
             tokio::spawn(conn);
 
+            let (mut parts, body) = req.into_parts();
+            let mut uri_parts = parts.uri.into_parts();
+            uri_parts.scheme = None;
+            uri_parts.authority = None;
+            parts.uri = hyper::Uri::from_parts(uri_parts)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            let req = Request::from_parts(parts, body);
             sender
                 .send_request(req)
                 .await
