@@ -567,7 +567,7 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin + 'static> Socks5Handler<'a, RW> {
         upstream: Option<Arc<outbound::UpstreamConfig>>,
     ) -> Self {
         Socks5Handler {
-            buff: vec![0u8; 1024].into_boxed_slice(),
+            buff: vec![0u8; 65535].into_boxed_slice(),
             stream,
             peer_addr,
             auth,
@@ -837,9 +837,14 @@ impl<'a, RW: AsyncRead + AsyncWrite + Unpin + 'static> Socks5Handler<'a, RW> {
                 IpAddr::V6(_) => 22,
             };
 
-            while let Ok((len, peer_addr)) =
-                udp_socket.recv_from(&mut buff[data_range_start..]).await
-            {
+            loop {
+                let (len, peer_addr) = match udp_socket.recv_from(&mut buff[data_range_start..]).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("UDP recv_from error: {}", e);
+                        break;
+                    }
+                };
                 let (_, right) = buff.split_at_mut(data_range_start);
 
                 if peer_addr == source_addr {

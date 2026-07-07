@@ -66,7 +66,9 @@ fn parse_host_port(authority: &str) -> (String, u16) {
             return (host.to_string(), port);
         }
     }
-    (authority.trim_start_matches('[').trim_end_matches(']').to_string(), 80)
+    let host = authority.trim_start_matches('[');
+    let host = host.split_once(']').map(|(h, _)| h).unwrap_or(host);
+    (host.to_string(), 80)
 }
 
 fn is_ip_host(host: &str) -> bool {
